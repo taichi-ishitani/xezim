@@ -188,3 +188,40 @@ endmodule
         "{lines:#?}"
     );
 }
+
+/// A rand set with a variable wider than 64 bits goes to the SAT path, which
+/// reports the items in conflict (its unsat core): both bounds on `data`,
+/// and neither of the satisfiable blocks.
+#[test]
+fn the_sat_path_reports_the_items_in_conflict() {
+    const WIDE: &str = "\
+class item;
+  rand bit [127:0] data;
+  rand int len;
+  constraint c_len { len inside {[1:4]}; }
+  constraint c_data { (data >> 8) == 0; data > 1000; }
+endclass
+module top;
+  initial begin
+    item it = new();
+    if (!it.randomize()) $display(\"randomize failed\");
+  end
+endmodule
+";
+    let (stdout, stderr) = run_sources("wide", &[("wide_diag.sv", WIDE)], true);
+    assert!(stdout.contains("randomize failed"), "{stdout}");
+    let lines = diag_lines(&stderr);
+    let item = |text: &str| {
+        lines
+            .iter()
+            .any(|l| l.contains("c_data") && l.contains("wide_diag.sv:5") && l.contains(text))
+    };
+    assert!(item("(data >> 8) == 0"), "{lines:#?}");
+    assert!(item("data > 1000"), "{lines:#?}");
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("wide_diag.sv:") && l.contains("c_len")),
+        "{lines:#?}"
+    );
+}

@@ -18,6 +18,17 @@ pub(super) struct RandDiag {
     fails: HashMap<(usize, usize), u32>,
 }
 
+impl RandDiag {
+    /// The items (constraint, item) a solver found in conflict, as one
+    /// rejected trial that each of them failed.
+    pub(super) fn record_conflict(&mut self, items: &[(usize, usize)]) {
+        self.trials += 1;
+        for &k in items {
+            *self.fails.entry(k).or_default() += 1;
+        }
+    }
+}
+
 /// The source span of a constraint item.
 fn item_span(item: &ConstraintItem) -> Option<crate::ast::Span> {
     match item {

@@ -713,6 +713,14 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Debug: on a failed randomize(), report the switched-off variables and constraints and the unsatisfied constraint items",
     ),
     (
+        "XEZIM_RAND_SAT",
+        "randomize() through the SAT solver: auto (default; rand sets with a variable wider than 64 bits), force (every set it can model), off",
+    ),
+    (
+        "XEZIM_RAND_SAT_DEBUG",
+        "Debug: print each problem randomize() hands to the SAT solver, and its outcome",
+    ),
+    (
         "XEZIM_RANGE_COPY",
         "Comb settle: lower direct constant-range assignments to slice copies (1 enables)",
     ),

@@ -2251,6 +2251,8 @@ mod module_paths;
 mod names;
 mod rand_csp;
 mod rand_diag;
+mod rand_sat;
+mod rand_sat_lower;
 
 /// Marks a `dist` target recorded by MEMBER path in `rand_order_sensitive`.
 const MEMBER_DIST_MARK: &str = "\u{1}member:";
@@ -141569,7 +141571,79 @@ impl Simulator {
         // solver first; the trials stay the fallback.
         let mut trials = 1000;
         let has_soft = Self::rand_has_soft(&constraints);
-        if csp_ok
+        // §18 / #261: a rand set with a variable wider than 64 bits is out of
+        // the CSP's reach (it holds `i128` values) and of the trial loop's
+        // repairs; `rand_sat` bit-blasts it onto a SAT solver. With
+        // `XEZIM_RAND_SAT=force` every set it can model goes there first.
+        let sat_mode = rand_sat_lower::rand_sat_mode();
+        let wide = rand_props.iter().any(|p| p.1 > 64) || rand_colls.iter().any(|c| c.width > 64);
+        let mut sat_unsat = false;
+        if randc_set.is_empty()
+            && real_rand_props.is_empty()
+            && rand_obj_props.is_empty()
+            && unpacked_agg_props.is_empty()
+            && rand_nd_arrays.is_empty()
+            && (sat_mode == rand_sat_lower::RandSatMode::Force
+                || (sat_mode == rand_sat_lower::RandSatMode::Auto && wide))
+        {
+            let saved = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.properties.clone());
+            let mut sat_conflict = Vec::new();
+            match self.rand_sat_solve(
+                handle,
+                &constraints,
+                &constraint_depth,
+                &rand_props,
+                &signed_rand_props,
+                &enum_prop_types,
+                &rand_colls,
+                &array_enums,
+                &mut sat_conflict,
+            ) {
+                rand_csp::CspOutcome::Sat if !self.randomize_budget_exhausted => {
+                    if has_post {
+                        self.exec_method_call(handle, "post_randomize", &[]);
+                    }
+                    self.this_stack.pop();
+                    self.class_context_stack.pop();
+                    if has_rand_children {
+                        self.rand_child_snapshots.pop();
+                    }
+                    return Value::from_u64(1, 32);
+                }
+                out => {
+                    if matches!(out, rand_csp::CspOutcome::Unsat) {
+                        // §18.6.1: the constraints cannot all hold.
+                        trials = 0;
+                        sat_unsat = true;
+                        if let Some(diag) = rand_diag.as_mut() {
+                            diag.record_conflict(&sat_conflict);
+                        }
+                    }
+                    if let (Some(p), Some(Some(inst))) = (saved, self.heap.get_mut(handle)) {
+                        inst.properties = p;
+                    }
+                    for (c, n, elems) in &coll_saved {
+                        if c.kind == CollKind::Dyn {
+                            self.resize_coll(&c.scoped, *n);
+                        }
+                        for (k, v) in elems {
+                            match v {
+                                Some(v) => self.write_coll_elem(k, v.clone()),
+                                None => {
+                                    self.signals.remove(k);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !sat_unsat
+            && csp_ok
             && rand_obj_props.is_empty()
             && !rand_colls.iter().any(|c| c.kind == CollKind::Dyn)
             && (has_soft || self.rand_order_sensitive(&constraints))

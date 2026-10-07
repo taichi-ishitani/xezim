@@ -320,6 +320,8 @@ mod randomize_member_subset;
 mod randomize_nonrand_members;
 #[path = "classes/randomize_solve_before.rs"]
 mod randomize_solve_before;
+#[path = "classes/randomize_wide_sat.rs"]
+mod randomize_wide_sat;
 #[path = "classes/randomize_with_this_and_subset.rs"]
 mod randomize_with_this_and_subset;
 #[path = "classes/randomize_work_budget.rs"]
@@ -481,6 +483,8 @@ mod concurrent_function_struct_local_shadow;
 mod condition_waiter_yields_to_inactive;
 #[path = "classes/constraint_shift_bounds.rs"]
 mod constraint_shift_bounds;
+#[path = "classes/constraint_shift_mask_wide.rs"]
+mod constraint_shift_mask_wide;
 #[path = "classes/covergroup_bin_arithmetic.rs"]
 mod covergroup_bin_arithmetic;
 #[path = "classes/dyn_array_struct_copy.rs"]

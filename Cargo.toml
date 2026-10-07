@@ -10,6 +10,11 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 ahash = { version = "0.8", features = ["serde"] }
 rand = "0.8"
+# `rand_sat`: constraints over rand variables of any width, bit-blasted onto
+# a SAT solver (§18; issue #261).
+batsat = "0.6"
+num-bigint = { version = "0.4", features = ["rand"] }
+num-traits = "0.2"
 # Fetched from git so `cargo build` works from a bare clone of this repo
 # alone — PINNED to the exact xezim-core revision this xezim revision was
 # tested against (a floating branch let a fresh clone resolve a core the
