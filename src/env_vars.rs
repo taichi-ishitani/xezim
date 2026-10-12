@@ -51,7 +51,6 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "XEZIM_ARRAY_SOA_SHADOW",
         "Arrays: shadow-verify structure-of-arrays storage against per-element Values",
     ),
-    ("XEZIM_AW_DBG", "Debug: trace assignment-width inference"),
     (
         "XEZIM_BC_DUMP",
         "Dump compiled bytecode blocks after compilation",
@@ -282,6 +281,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Edge engine: shadow-compare dirty-driven scan vs full scan",
     ),
     (
+        "XEZIM_DPI_FIBERS",
+        "DPI: 0 runs waits inside imported tasks on the nested scheduler instead of per-call stacks",
+    ),
+    (
         "XEZIM_DPI_STACK_MB",
         "Stack size in MB reserved for each running DPI imported-task call (default 256)",
     ),
@@ -399,6 +402,22 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Bytecode: max foreach unroll replay count",
     ),
     (
+        "XEZIM_FST_COMMIT_LOG",
+        "FST: print the end time of each value-change block as it reaches the dump (testing)",
+    ),
+    (
+        "XEZIM_FST_FLUSH_SECS",
+        "FST: write the in-memory value-change block to disk every N wall seconds (default 2; 0 = only at 64 MB)",
+    ),
+    (
+        "XEZIM_FST_KILL_AT",
+        "FST (testing): SIGKILL the run at a point of the n-th block commit: initial|torn|body|committed|last|header[:n]",
+    ),
+    (
+        "XEZIM_FST_STAGE",
+        "FST (testing): `file` stages value-change blocks in a temporary file beside the dump instead of memory",
+    ),
+    (
         "XEZIM_FUSE",
         "Bytecode: enable/disable insn fusion peepholes (0/1)",
     ),
@@ -460,7 +479,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_INIT_REG",
-        "Init: initial value policy for registers (x/0/rand)",
+        "Init: initial value of registers: 0, or random (varies with +seed=/-sv_seed)",
     ),
     ("XEZIM_INIT_ZERO", "Init: start all state at 0 instead of x"),
     (
@@ -872,7 +891,11 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_UVM_DIR",
-        "Path to a UVM source tree auto-added for UVM designs",
+        "UVM source tree (src dir, release root or multi-release checkout) added to UVM designs",
+    ),
+    (
+        "XEZIM_UVM_VERSION",
+        "Release subdirectory of a multi-release XEZIM_UVM_DIR checkout (default: newest present)",
     ),
     (
         "XEZIM_VALUE_TRACE",

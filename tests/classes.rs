@@ -17,16 +17,26 @@ mod array_equality_class;
 mod assoc_typedef_element_class;
 #[path = "classes/bit_class_property_signedness.rs"]
 mod bit_class_property_signedness;
+#[path = "classes/block_local_shadows_enclosing.rs"]
+mod block_local_shadows_enclosing;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
+#[path = "classes/blocklocal_struct_named_like_member.rs"]
+mod blocklocal_struct_named_like_member;
 #[path = "classes/class_assoc_struct_string_keys.rs"]
 mod class_assoc_struct_string_keys;
+#[path = "classes/class_formal_named_like_struct.rs"]
+mod class_formal_named_like_struct;
 #[path = "classes/class_formal_typedef_widen.rs"]
 mod class_formal_typedef_widen;
 #[path = "classes/class_interface_same_name.rs"]
 mod class_interface_same_name;
 #[path = "classes/class_member_name_clash.rs"]
 mod class_member_name_clash;
+#[path = "classes/class_method_named_put_from_function.rs"]
+mod class_method_named_put_from_function;
+#[path = "classes/compiled_method_static_locals.rs"]
+mod compiled_method_static_locals;
 #[path = "classes/class_param_default_scope.rs"]
 mod class_param_default_scope;
 #[path = "classes/class_queue_struct_member_arrays.rs"]
@@ -49,6 +59,8 @@ mod constructor_body_ports;
 mod ctor_bare_member_dynarray_size;
 #[path = "classes/explicit_param_static_coll_read.rs"]
 mod explicit_param_static_coll_read;
+#[path = "classes/foreach_assoc_key_handle_write.rs"]
+mod foreach_assoc_key_handle_write;
 #[path = "classes/foreach_cross_elem_whole_equality.rs"]
 mod foreach_cross_elem_whole_equality;
 #[path = "classes/foreach_packed_struct_member_inside.rs"]
@@ -59,12 +71,16 @@ mod function_local_struct_return_shadow;
 mod implements_typedef_scope;
 #[path = "classes/inherited_local_member.rs"]
 mod inherited_local_member;
+#[path = "classes/integral_prop_named_like_struct.rs"]
+mod integral_prop_named_like_struct;
 #[path = "classes/interface_class_inherited_names.rs"]
 mod interface_class_inherited_names;
 #[path = "classes/memory_tasks_fixed_property.rs"]
 mod memory_tasks_fixed_property;
 #[path = "classes/nested_same_named_ref_assoc_formal.rs"]
 mod nested_same_named_ref_assoc_formal;
+#[path = "classes/nested_static_call_named_args.rs"]
+mod nested_static_call_named_args;
 #[path = "classes/param_type_binding_resolves_enclosing_value_param.rs"]
 mod param_type_binding_resolves_enclosing_value_param;
 #[path = "classes/parameterized_class_scope.rs"]
@@ -91,8 +107,12 @@ mod struct_member_bitselect_frame_local;
 mod struct_member_class_handle_new;
 #[path = "classes/subroutine_formal_frame_type.rs"]
 mod subroutine_formal_frame_type;
+#[path = "classes/task_static_one_cell_per_declaration.rs"]
+mod task_static_one_cell_per_declaration;
 #[path = "classes/this_collection_struct_members.rs"]
 mod this_collection_struct_members;
+#[path = "classes/this_path_state_soft_randomize.rs"]
+mod this_path_state_soft_randomize;
 #[path = "classes/this_super_member.rs"]
 mod this_super_member;
 #[path = "classes/type_param_base_class.rs"]
@@ -194,6 +214,20 @@ mod class_value_params;
 mod class_width_copy_fork;
 #[path = "classes/compiled_method_accessors.rs"]
 mod compiled_method_accessors;
+#[path = "classes/compiled_method_output_formals.rs"]
+mod compiled_method_output_formals;
+#[path = "classes/compiled_method_static_local_vars.rs"]
+mod compiled_method_static_local_vars;
+#[path = "classes/compiled_nonvirtual_dispatch.rs"]
+mod compiled_nonvirtual_dispatch;
+#[path = "classes/compiled_pkg_fn_scope.rs"]
+mod compiled_pkg_fn_scope;
+#[path = "classes/compiled_task_wait_analysis.rs"]
+mod compiled_task_wait_analysis;
+#[path = "classes/compiled_method_type_param_members.rs"]
+mod compiled_method_type_param_members;
+#[path = "classes/compiled_method_free_fn_caller_locals.rs"]
+mod compiled_method_free_fn_caller_locals;
 #[path = "classes/compiled_method_array_members.rs"]
 mod compiled_method_array_members;
 #[path = "classes/compiled_method_cast.rs"]
@@ -266,6 +300,8 @@ mod covergroup_sample_args;
 mod covergroup_sampling_event;
 #[path = "classes/factory_run_test.rs"]
 mod factory_run_test;
+#[path = "classes/factory_typedef_chain.rs"]
+mod factory_typedef_chain;
 #[path = "classes/foreach_member_multidim.rs"]
 mod foreach_member_multidim;
 #[path = "classes/generate_and_class_parameters.rs"]
@@ -290,6 +326,10 @@ mod local_shadows_sig;
 mod localparam_class_not_parameterized;
 #[path = "classes/method_default_this_call.rs"]
 mod method_default_this_call;
+#[path = "classes/method_output_assoc_writeback.rs"]
+mod method_output_assoc_writeback;
+#[path = "classes/method_output_class_property_writeback.rs"]
+mod method_output_class_property_writeback;
 #[path = "classes/module_scope_derived_constraints.rs"]
 mod module_scope_derived_constraints;
 #[path = "classes/nba_region_event_same_slot.rs"]
@@ -310,14 +350,40 @@ mod param_typedef_ctor_resolution;
 mod process_class_9_7;
 #[path = "classes/pure_sv_phase_objection.rs"]
 mod pure_sv_phase_objection;
+#[path = "classes/randomize_countones_count.rs"]
+mod randomize_countones_count;
 #[path = "classes/randomize_dist_weights.rs"]
 mod randomize_dist_weights;
+#[path = "classes/randomize_foreach_accept.rs"]
+mod randomize_foreach_accept;
+#[path = "classes/randomize_issues_295_297.rs"]
+mod randomize_issues_295_297;
+#[path = "classes/randomize_issues_298_299.rs"]
+mod randomize_issues_298_299;
+#[path = "classes/randomize_shift_mask_wide_peer.rs"]
+mod randomize_shift_mask_wide_peer;
 #[path = "classes/randomize_inside_range.rs"]
 mod randomize_inside_range;
+#[path = "classes/randomize_object_arrays.rs"]
+mod randomize_object_arrays;
+#[path = "classes/randomize_issue_255_full.rs"]
+mod randomize_issue_255_full;
+#[path = "classes/randomize_issue_255_shapes.rs"]
+mod randomize_issue_255_shapes;
+#[path = "classes/randomize_issue_261_wide.rs"]
+mod randomize_issue_261_wide;
+#[path = "classes/randomize_with_receiver_qualified_element.rs"]
+mod randomize_with_receiver_qualified_element;
+#[path = "classes/randomize_with_receiver_scope.rs"]
+mod randomize_with_receiver_scope;
+#[path = "classes/randomize_with_receiver_size.rs"]
+mod randomize_with_receiver_size;
 #[path = "classes/randomize_member_subset.rs"]
 mod randomize_member_subset;
 #[path = "classes/randomize_nonrand_members.rs"]
 mod randomize_nonrand_members;
+#[path = "classes/randomize_soft_solver_gave_up.rs"]
+mod randomize_soft_solver_gave_up;
 #[path = "classes/randomize_solve_before.rs"]
 mod randomize_solve_before;
 #[path = "classes/randomize_wide_sat.rs"]
@@ -422,6 +488,12 @@ mod class_property_over_module_signal;
 mod concurrent_method_local_arrays;
 #[path = "classes/concurrent_method_local_queues.rs"]
 mod concurrent_method_local_queues;
+#[path = "classes/module_auto_task_local_array.rs"]
+mod module_auto_task_local_array;
+#[path = "classes/default_automatic_task_locals.rs"]
+mod default_automatic_task_locals;
+#[path = "classes/method_output_multidim_and_chain_property.rs"]
+mod method_output_multidim_and_chain_property;
 #[path = "classes/instance_class_handles_start_null.rs"]
 mod instance_class_handles_start_null;
 #[path = "classes/interface_array_handle_new.rs"]
@@ -475,6 +547,14 @@ mod cls_agg_members_in_struct;
 mod cls_agg_members_matrix;
 #[path = "classes/compiled_method_admission_regression.rs"]
 mod compiled_method_admission_regression;
+#[path = "classes/compiled_task_and_free_fn_chain.rs"]
+mod compiled_task_and_free_fn_chain;
+#[path = "classes/compiled_collection_return_store.rs"]
+mod compiled_collection_return_store;
+#[path = "classes/compiled_member_redeclared.rs"]
+mod compiled_member_redeclared;
+#[path = "classes/int_property_named_like_struct_property.rs"]
+mod int_property_named_like_struct_property;
 #[path = "classes/compiled_method_test_env.rs"]
 mod compiled_method_test_env;
 #[path = "classes/concurrent_function_struct_local_shadow.rs"]
@@ -499,6 +579,8 @@ mod formal_class_type_frame_scoped;
 mod handle_chain_read_in_instance_task;
 #[path = "classes/heap_id_collision_member_access.rs"]
 mod heap_id_collision_member_access;
+#[path = "classes/iff_guard_parked_context.rs"]
+mod iff_guard_parked_context;
 #[path = "classes/id_collision_in_heap.rs"]
 mod id_collision_in_heap;
 #[path = "classes/implication_joint_distribution.rs"]
@@ -601,3 +683,17 @@ mod vif_receiver_operation_matrix;
 mod vif_resource_db_shape;
 #[path = "classes/vif_static_roundtrip.rs"]
 mod vif_static_roundtrip;
+#[path = "classes/class_member_named_like_instance.rs"]
+mod class_member_named_like_instance;
+#[path = "classes/covergroup_class_param_bins.rs"]
+mod covergroup_class_param_bins;
+#[path = "classes/class_method_scalar_formal_width.rs"]
+mod class_method_scalar_formal_width;
+#[path = "classes/typedef_packed_return_prototype.rs"]
+mod typedef_packed_return_prototype;
+#[path = "classes/inherited_type_param_create.rs"]
+mod inherited_type_param_create;
+#[path = "classes/dynamic_array_property_new_init.rs"]
+mod dynamic_array_property_new_init;
+#[path = "classes/type_param_handle_not_struct.rs"]
+mod type_param_handle_not_struct;

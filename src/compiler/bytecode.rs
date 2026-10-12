@@ -18,6 +18,26 @@ const MAX_INLINE_DEPTH: usize = 8;
 pub(crate) struct MethodAdmission {
     pub writeback_positions: HashMap<String, HashSet<usize>>,
     pub instance_fields: HashMap<String, HashSet<String>>,
+    /// §8.20: declared class -> method -> the class whose body a call
+    /// through a handle of that declared type binds to, for every
+    /// NON-virtual method that some subclass redeclares (the only case where
+    /// the object's dynamic class would pick a different body).
+    pub nonvirtual_targets: HashMap<String, HashMap<String, String>>,
+    /// Free-function facts the method compiles keep asking for; the function
+    /// table they come from is the same for every method compile.
+    pub fn_facts: FnFacts,
+}
+
+/// Memoized free-function facts (see `MethodAdmission::fn_facts`).
+#[derive(Default)]
+pub(crate) struct FnFacts {
+    /// (declaration name and source span, instance prefix, external reads
+    /// allowed) -> `fn_is_pure_in_ext`. Only verdicts that do not depend on
+    /// the recursion-depth cutoff are kept.
+    #[allow(clippy::type_complexity)]
+    pure: std::cell::RefCell<HashMap<(String, usize, usize, Option<String>, bool), bool>>,
+    /// Callee name -> no instance-qualified twin exists (`compile_pure_call`).
+    ext_reads_ok: std::cell::RefCell<HashMap<String, bool>>,
 }
 
 /// A register in the bytecode VM. Registers hold Values. The compact u16
@@ -628,6 +648,23 @@ pub enum Insn {
     /// `local_var_regs` for the loop's duration.
     ForeachNext(RegId, u32, RegId),
 
+    /// class-perf collection-return: materialize the method's `return '{…}`
+    /// literal into the reserved interpreter snapshot store — element `i`
+    /// from register `arg_start + i` — then hand it to the caller through
+    /// `pending_ret_collection`. The result register is a dead passthrough
+    /// (width 0), exactly like a class-handle return.
+    RetCollection(u32, u32),
+
+    /// class-perf collection-return store (§13.4): `q = f(..)` in a
+    /// compiled body, `q` a bare LOCAL queue / dynamic array. `key` is the
+    /// destination's `local_coll_key` (`\x01`-prefixed) and the register is
+    /// the call's result. Emitted after the call whose result is that
+    /// register; every call arm records the collection the callee handed
+    /// back (`vm_ret_coll`), and this insn copies it whole into the local.
+    /// With nothing handed back it assigns the scalar result, as the
+    /// interpreter's blocking assign does.
+    AssignPendingColl(Box<str>, RegId),
+
     Nop,
 
     /// Fused `LoadSignal` + `RangeSelectConst`: dest = signal_table[sig][left:right].
@@ -835,6 +872,17 @@ pub struct CompiledBlock {
     /// addresses (compile-time indices into the runtime arena). Zero for
     /// every block without a compiled member-collection foreach.
     pub foreach_slots: u32,
+    /// class-perf §6.21: the METHOD body's `static` locals, as
+    /// `(name, reg, default)`; empty for module blocks. The method
+    /// dispatch shell seeds each register from `static_local_vars`
+    /// before the block runs and copies the final register back into
+    /// the locals frame afterwards so the exit sync persists it. The
+    /// block itself never seeds the register (see
+    /// `method_static_locals`).
+    /// Cold for module blocks: boxed so the comb settle hot loop's
+    /// `CombItem::CompiledContAssign { compiled }` variant keeps its
+    /// cache-compact layout (see `comb_entry_layout_stays_cache_compact`).
+    pub static_locals: Box<[(String, RegId, Value)]>,
 }
 
 /// class-perf Step 7: one resolved method-dispatch target, shared by `Rc`
@@ -879,6 +927,10 @@ pub(super) struct PreboundCompiledMethod {
     /// relational/arith operands): the interpreter routes those through the
     /// `string_signals` registry, which the compiled block cannot see.
     pub string_formals: std::rc::Rc<HashSet<String>>,
+    /// class-perf collection-return: the return type is a queue / unsized
+    /// dynamic array — the body returns via the `pending_ret_collection`
+    /// side channel; the result cell is a width-0 passthrough.
+    pub is_collection_result: bool,
     /// class-perf Step 9b: member-collection names callable with a value-
     /// arg builtin (`size`/`num`, `exists`, `delete`, `push_back`/
     /// `push_front`, `pop_front`/`pop_back`, `insert`) — see the simulator's
@@ -1119,6 +1171,10 @@ impl Insn {
                 *o += rb;
                 *v += rb;
             }
+            // The collection-return hand-off reads a contiguous arg range
+            // (no rebasing needed beyond the range itself — the base is an
+            // absolute slot like CallFreeFunction's).
+            RetCollection(_, _) => {}
             RangeSelectW(a, b, c, _, _) => {
                 *a += rb;
                 *b += rb;
@@ -1169,11 +1225,24 @@ impl Insn {
             // destination); a static STORE / object construction is
             // non-offsettable (side effects / interpreter re-entry).
             LoadClassStatic(a, _) => *a += rb,
-            LoadProcessLocal(..) | Format(..) | CaseJump(..) | CaseMaskJump(..)
-            | StmtFallback(..) | EvalExprFallback(..) | WaitDelayReg(..) | WaitEdge(..)
-            | CallMethod(..) | CallCollMethod(..) | LoadCollElem(..) | StoreCollElem(..)
-            | CallScopedMethod(..) | StoreClassStatic(..) | ConstructObject(..)
-            | CallStaticScoped(..) | CallFreeFunction(..) => return false,
+            LoadProcessLocal(..)
+            | Format(..)
+            | CaseJump(..)
+            | CaseMaskJump(..)
+            | StmtFallback(..)
+            | EvalExprFallback(..)
+            | WaitDelayReg(..)
+            | WaitEdge(..)
+            | CallMethod(..)
+            | CallCollMethod(..)
+            | LoadCollElem(..)
+            | StoreCollElem(..)
+            | CallScopedMethod(..)
+            | StoreClassStatic(..)
+            | ConstructObject(..)
+            | CallStaticScoped(..)
+            | CallFreeFunction(..)
+            | AssignPendingColl(..) => return false,
         }
         true
     }
@@ -1252,6 +1321,8 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::Cast(..) => "Cast",
         Insn::ForeachKeys(..) => "FeKeys",
         Insn::ForeachNext(..) => "FeNext",
+        Insn::RetCollection(..) => "RetColl",
+        Insn::AssignPendingColl(..) => "AssignPC",
         Insn::Nop => "Nop",
         Insn::Jump(..) => "Jump",
         Insn::BranchIfFalse(..) => "Br",
@@ -1462,6 +1533,16 @@ pub struct BytecodeCompiler<'a> {
     /// class-perf P2 (typed handle roots): local/formal name -> declared
     /// class; resolves dispatch chains rooted at handle locals statically.
     method_handle_local_types: HashMap<String, String>,
+    /// §6.21: the method body's STATIC locals lowered to register-backed
+    /// slots whose value persists across calls. The dispatch shell seeds
+    /// each register from `static_local_vars` before the block runs and
+    /// copies the final register back into the locals frame afterwards so
+    /// the exit sync persists it. The block itself NEVER seeds the register:
+    /// a compile-time default would let `fold_const_regs` fold e.g.
+    /// `m_inst == null` to true, silently constructing a fresh singleton on
+    /// every call. `(name, reg, default)`: `default` is the first-call
+    /// seed, exactly the AST declaration's.
+    method_static_locals: Vec<(String, RegId, Value)>,
     /// class-perf P2: method names returning `string` in every declaring
     /// class — string-concat operand typing for method-call operands.
     method_string_ret_names: HashSet<String>,
@@ -1559,6 +1640,15 @@ pub struct BytecodeCompiler<'a> {
     /// the result Value (a byte vector) passes through untouched — the Return
     /// handler tolerates an absent width and skips the Resize.
     method_result_is_string: bool,
+    /// class-perf collection-return: the method's return type is a queue /
+    /// unsized dynamic array. `return '{…}` literals lower to `RetCollection`
+    /// (side-channel hand-off); other return expression forms bail.
+    method_ret_is_collection: bool,
+    /// class-perf free-function tier: compiling a package/module-scope
+    /// FUNCTION (no class scope). Bare names outside the frame (package
+    /// variables, statics) are unresolvable storage for the compiled block
+    /// — any read of one declines the whole body (see the Ident arm).
+    free_function_mode: bool,
     /// String-typed formal names (plan-provided). Any use of one outside the
     /// pass-through surface (read, compare, assign, concat, call arg, return)
     /// bails: indexing/string-methods/arith take interpreter-only paths.
@@ -1667,6 +1757,7 @@ pub struct BytecodeCompiler<'a> {
     /// and narrows the fallback to just the inner $write/$display.
     tasks: Option<&'a HashMap<String, TaskDeclaration>>,
     functions: Option<&'a HashMap<String, FunctionDeclaration>>,
+    dpi_import_fds: Option<std::rc::Rc<HashMap<String, FunctionDeclaration>>>,
     inlining_stack: Vec<String>,
     pub tasks_inlined: u32,
     /// Elaborated module parameters — used by `eval_const_expr` so that
@@ -1772,6 +1863,9 @@ pub struct BytecodeCompiler<'a> {
     /// purity). Past the cap the answer is "not pure", which merely keeps the
     /// call on the AST interpreter — where recursion already works.
     purity_depth: std::cell::Cell<u32>,
+    /// Set when a purity check hit `MAX_PURITY_DEPTH` (its `false` is then
+    /// depth-dependent and not memoized).
+    purity_cut: std::cell::Cell<bool>,
     /// Local/formal names (in the current inline scope) bound to STRING
     /// values — drives `%s` semantics and resize suppression. Name-based on
     /// purpose: register ids are recycled across arms, names are not.
@@ -1857,6 +1951,7 @@ impl<'a> BytecodeCompiler<'a> {
             method_this_reg: None,
             method_handle_names: std::collections::HashSet::default(),
             method_handle_local_types: HashMap::default(),
+            method_static_locals: Vec::new(),
             method_string_ret_names: HashSet::default(),
             pkg_enum_consts: HashMap::default(),
             class_shadow_names: HashSet::default(),
@@ -1880,6 +1975,8 @@ impl<'a> BytecodeCompiler<'a> {
             method_result_width: None,
             method_result_is_class: false,
             method_result_is_string: false,
+            method_ret_is_collection: false,
+            free_function_mode: false,
             string_formal_names: HashSet::default(),
             string_member_names: HashSet::default(),
             coll_member_names: HashSet::default(),
@@ -1895,6 +1992,7 @@ impl<'a> BytecodeCompiler<'a> {
             allow_expr_fallback: false,
             tasks: None,
             functions: None,
+            dpi_import_fds: None,
             inlining_stack: Vec::new(),
             tasks_inlined: 0,
             params: None,
@@ -1922,6 +2020,7 @@ impl<'a> BytecodeCompiler<'a> {
             local_var_array: HashMap::default(),
             const_var_binds: HashMap::default(),
             purity_depth: std::cell::Cell::new(0),
+            purity_cut: std::cell::Cell::new(false),
             inline_ret: None,
             inline_ret_jumps: Vec::new(),
             multi_dim_arrays: None,
@@ -2490,6 +2589,17 @@ impl<'a> BytecodeCompiler<'a> {
         self.functions = Some(functions);
     }
 
+    /// DPI import prototypes by SV-visible name. A compiled body may call an
+    /// import directly (e.g. `uvm_re_compexecfree` under `uvm_re_match`);
+    /// imports are not in `functions`, so the pure-call planner needs their
+    /// ports to shape `CallFreeFunction` emission.
+    pub fn set_dpi_import_fds(
+        &mut self,
+        m: std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>>,
+    ) {
+        self.dpi_import_fds = Some(m);
+    }
+
     pub fn set_tasks(&mut self, tasks: &'a HashMap<String, TaskDeclaration>) {
         self.tasks = Some(tasks);
     }
@@ -2612,6 +2722,41 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// §26.3: the function-table key a BARE call names from the body being
+    /// compiled. Inside a package function (free-function mode under
+    /// `__free_fn__<pkg>`) a name declared in several scopes resolves in the
+    /// enclosing package first, which the table keeps as `pkg::name` (the
+    /// bare key holds whichever declaration registered last). A contested
+    /// name the package does not declare itself, or one met inside an
+    /// inlined callee (whose own package may differ), returns `None` so the
+    /// body stays on the interpreter, which resolves it at run time.
+    /// Uncontested names and every other compile mode keep the bare key.
+    fn scoped_callee_name(&self, bare: String) -> Option<String> {
+        if !self.free_function_mode || bare.contains("::") {
+            return Some(bare);
+        }
+        let Some(pkg) = self
+            .method_class
+            .as_deref()
+            .and_then(|c| c.strip_prefix("__free_fn__"))
+            .filter(|p| !p.is_empty())
+        else {
+            return Some(bare);
+        };
+        let Some(f) = self.functions else {
+            return Some(bare);
+        };
+        let suffix = format!("::{bare}");
+        if !f.keys().any(|k| k.ends_with(suffix.as_str())) {
+            return Some(bare);
+        }
+        if !self.inlining_stack.is_empty() {
+            return None;
+        }
+        let qualified = format!("{pkg}{suffix}");
+        f.contains_key(&qualified).then_some(qualified)
+    }
+
     /// Try to inline a zero-arg, non-blocking user task's body at this
     /// call site. Returns true if successfully inlined.
     /// Inline a call to a pure combinational function, yielding the register
@@ -2632,16 +2777,207 @@ impl<'a> BytecodeCompiler<'a> {
                 return None;
             }
         };
+        let Some(name) = self.scoped_callee_name(name) else {
+            self.bail("Expr_Call_pkg_scope");
+            return None;
+        };
         if self.inlining_stack.len() >= MAX_INLINE_DEPTH
             || self.inlining_stack.iter().any(|n| *n == name)
         {
             self.bail("Expr_Call_depth");
             return None;
         }
+        // DPI import callee: not in the function table, but the interpreter
+        // can execute it (exec_dpi_import_call). Emit a CallFreeFunction —
+        // the exec arm falls back to the DPI dispatch when fn_decl_rc
+        // misses. Admission mirrors the inlinable shape: input-only ports
+        // (plus assignable `output` formals for functions like
+        // uvm_re_compexecfree), no dimensions, arity matches after named-arg
+        // normalization. Same register-file context as the existing
+        // CallFreeFunction lowering, so method mode only. Structural only.
+        if self.method_mode
+            && let Some(idf) = self
+                .dpi_import_fds
+                .as_deref()
+                .and_then(|m| m.get(&name))
+                .cloned()
+        {
+            let args: Vec<Expression> =
+                crate::compiler::simulator::Simulator::normalize_call_args(&idf.ports, args)
+                    .unwrap_or_else(|| args.to_vec());
+            if idf.ports.len() != args.len()
+                || !idf
+                    .ports
+                    .iter()
+                    .all(|p| matches!(p.direction, PortDirection::Input | PortDirection::Output))
+                || idf.ports.iter().any(|p| !p.dimensions.is_empty())
+            {
+                self.bail("Expr_Call_ports");
+                return None;
+            }
+            let mut ok = true;
+            let call_start = self.insns.len();
+            let call_next = self.next_reg;
+            let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
+            for a in &args {
+                match self.compile_expr(a, 0) {
+                    Some(r) => arg_values.push(r),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                let dest = self.alloc_reg();
+                let n = arg_values.len() as u32;
+                let arg_start = self.alloc_reg();
+                for _ in 1..arg_values.len() {
+                    self.alloc_reg();
+                }
+                for (i, &v) in arg_values.iter().enumerate() {
+                    let slot = (arg_start as usize + i) as RegId;
+                    if slot != v {
+                        self.emit(Insn::Move(slot, v));
+                    }
+                }
+                self.emit(Insn::CallFreeFunction(
+                    dest,
+                    Box::new(Name(name.into_boxed_str())),
+                    arg_start,
+                    n,
+                ));
+                // `output` formals of the import: the callee writes the
+                // synthesized actuals in place; copy them back to the
+                // caller's lvalues.
+                for (i, p) in idf.ports.iter().enumerate() {
+                    if matches!(p.direction, PortDirection::Output) {
+                        if !self.compile_blocking_target(
+                            &args[i],
+                            (arg_start as usize + i) as RegId,
+                            0,
+                        ) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    return Some(dest);
+                }
+            }
+            self.insns.truncate(call_start);
+            self.next_reg = call_next;
+            self.bail("Expr_Call_dpi");
+            return None;
+        }
         let Some(fd) = self.functions.and_then(|f| f.get(&name)).cloned() else {
             self.bail("Expr_Call");
             return None;
         };
+        // §13.5.4 named actuals (`.re(expr)`) normalize to positional order
+        // (with §13.5.3 defaults filled) so every path below — delegation and
+        // inline — sees a plain positional actual list.
+        let owned_args;
+        let args: &[Expression] = if args
+            .iter()
+            .any(|a| matches!(a.kind, ExprKind::NamedArg { .. } | ExprKind::Empty))
+        {
+            // A failed normalization (nothing bindable) keeps the call on
+            // the interpreter instead of compiling a zero-argument call.
+            let Some(v) =
+                crate::compiler::simulator::Simulator::normalize_call_args(&fd.ports, args)
+            else {
+                self.bail("Expr_Call_named_args");
+                return None;
+            };
+            owned_args = v;
+            &owned_args
+        } else {
+            args
+        };
+        // Whether the callee may be inlined: decided at most once, for the
+        // delegation shape below or the inline path after it.
+        let mut fn_pure_memo: Option<bool> = None;
+        let mut fn_pure = |me: &Self| -> bool {
+            *fn_pure_memo.get_or_insert_with(|| {
+                let ext = me.callee_ext_reads_ok(&name);
+                me.fn_is_pure_in_ext(&fd, name.rsplit_once('.').map(|(p, _)| p), ext)
+            })
+        };
+        // class-perf delegation: a callee that cannot be INLINED (impure, or
+        // a `string` formal the inline shape rejects) but whose ports are
+        // all scalar inputs with a matching arity is still callable from
+        // compiled code: emit CallFreeFunction and let the exec arm
+        // re-enter the interpreter (exec_function_call), exactly like the
+        // class-method CallMethod lowering. This keeps the caller compiled
+        // — the callee's side effects run with full interpreter semantics.
+        {
+            let input_only_scalar = fd
+                .ports
+                .iter()
+                .all(|p| matches!(p.direction, PortDirection::Input) && p.dimensions.is_empty());
+            let arity_le = args.len() <= fd.ports.len()
+                && !args
+                    .iter()
+                    .any(|a| matches!(a.kind, ExprKind::NamedArg { .. } | ExprKind::Empty));
+            let has_string_port = fd.ports.iter().any(|p| {
+                matches!(
+                    &p.data_type,
+                    crate::ast::types::DataType::Simple {
+                        kind: crate::ast::types::SimpleType::String,
+                        ..
+                    }
+                )
+            });
+            if self.method_mode
+                && input_only_scalar
+                && arity_le
+                && (has_string_port || !fn_pure(self))
+            {
+                let call_start = self.insns.len();
+                let call_next = self.next_reg;
+                let mut ok = true;
+                let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
+                for a in args {
+                    match self.compile_expr(a, 0) {
+                        Some(r) => arg_values.push(r),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    let dest = self.alloc_reg();
+                    let n = arg_values.len() as u32;
+                    let arg_start = self.alloc_reg();
+                    for _ in 1..arg_values.len() {
+                        self.alloc_reg();
+                    }
+                    for (i, &v) in arg_values.iter().enumerate() {
+                        let slot = (arg_start as usize + i) as RegId;
+                        if slot != v {
+                            self.emit(Insn::Move(slot, v));
+                        }
+                    }
+                    self.emit(Insn::CallFreeFunction(
+                        dest,
+                        Box::new(Name(name.clone().into_boxed_str())),
+                        arg_start,
+                        n,
+                    ));
+                    // The defaulted tail is bound by exec_function_call's
+                    // own §13.5.3 normalization; outputs are excluded by
+                    // input_only_scalar.
+                    return Some(dest);
+                }
+                self.insns.truncate(call_start);
+                self.next_reg = call_next;
+                self.bail("Expr_Call_delegate");
+                return None;
+            }
+        }
 
         // §6.6.7 resolver dispatch: a DYNAMIC-ARRAY formal (`input real
         // drivers[]`) whose actual is a FIXED assignment pattern is
@@ -2720,12 +3056,7 @@ impl<'a> BytecodeCompiler<'a> {
         // the value may then depend on module state, and the CA dependency
         // machinery follows callee reads, so re-evaluation still triggers).
         // Writes to module state stay disqualifying either way.
-        let allow_ext_reads = name.contains('.')
-            || self.functions.is_some_and(|f| {
-                let suffix = format!(".{}", name);
-                !f.keys().any(|k| k.ends_with(suffix.as_str()))
-            });
-        if !self.fn_is_pure_in_ext(&fd, name.rsplit_once('.').map(|(p, _)| p), allow_ext_reads) {
+        if !fn_pure(self) {
             if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
                 eprintln!("[INLINE-FAIL] fn {} reason=impure", name);
             }
@@ -2960,6 +3291,10 @@ impl<'a> BytecodeCompiler<'a> {
         self.allow_ast_fallback = false;
         let saved_ret = self.inline_ret;
         let saved_ret_jumps = std::mem::take(&mut self.inline_ret_jumps);
+        // §12.8: break/continue belong to loops in this subroutine, never
+        // the caller. A failed body can leave unfinished loop frames behind.
+        let saved_break_patches = std::mem::take(&mut self.loop_break_patches);
+        let saved_continue_patches = std::mem::take(&mut self.loop_continue_patches);
         self.inline_ret = Some((Some(ret_slot), ret_w));
         let mut ok = self.compile_pure_body(&items, ret_slot, ret_w, ctx_width);
         // Early returns land HERE — after the body, before the output-formal
@@ -2970,6 +3305,8 @@ impl<'a> BytecodeCompiler<'a> {
         }
         self.inline_ret = saved_ret;
         self.inline_ret_jumps = saved_ret_jumps;
+        self.loop_break_patches = saved_break_patches;
+        self.loop_continue_patches = saved_continue_patches;
         if ok {
             for (target, value, width) in &ref_writes {
                 if !self.compile_blocking_target(target, *value, *width) {
@@ -3330,6 +3667,10 @@ impl<'a> BytecodeCompiler<'a> {
             self.inlining_stack.push(task_name.to_string());
             let saved_ret = self.inline_ret;
             let saved_ret_jumps = std::mem::take(&mut self.inline_ret_jumps);
+            // Keep the caller's loop fixups out of the task's body, including
+            // when a failed lowering leaves unfinished loop frames behind.
+            let saved_break_patches = std::mem::take(&mut self.loop_break_patches);
+            let saved_continue_patches = std::mem::take(&mut self.loop_continue_patches);
             self.inline_ret = Some((None, 0));
             for st in &body {
                 if !self.compile_stmt(st) {
@@ -3344,6 +3685,8 @@ impl<'a> BytecodeCompiler<'a> {
             }
             self.inline_ret = saved_ret;
             self.inline_ret_jumps = saved_ret_jumps;
+            self.loop_break_patches = saved_break_patches;
+            self.loop_continue_patches = saved_continue_patches;
             self.inlining_stack.pop();
             self.inline_foreign -= foreign as u32;
             self.m_labels = saved_labels;
@@ -3380,7 +3723,7 @@ impl<'a> BytecodeCompiler<'a> {
                 );
             }
             // A half-emitted body writes REAL signals — roll everything back.
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
             return false;
         }
@@ -4658,6 +5001,65 @@ impl<'a> BytecodeCompiler<'a> {
         })
     }
 
+    /// class-perf method-mode: a member read rooted at an ELEMENT of a
+    /// class-handle member collection — `m[k].data`, `this.aa[k].field`,
+    /// `obj.q[i].m`. The base is an Index whose indexed name is a class
+    /// member collection storing HANDLE elements. It lowers in two steps that
+    /// mirror the interpreter exactly: `compile_member_coll_elem_read` emits a
+    /// `LoadCollElem` whose value IS the element's heap handle, then
+    /// `LoadClassMember` reads `member` off that handle. Returns None for any
+    /// non-method, non-class-element, or un-admitted shape (the enclosing
+    /// statement keeps the AST path).
+    fn compile_member_handle_elem_member(
+        &mut self,
+        base: &crate::ast::expr::Expression,
+        member: &str,
+    ) -> Option<RegId> {
+        use crate::ast::expr::ExprKind;
+        if !self.method_mode {
+            return None;
+        }
+        let ExprKind::Index {
+            expr: coll_base,
+            index,
+        } = &base.kind
+        else {
+            return None;
+        };
+        // Resolve the indexed base to a class-member collection and its
+        // element class (`handle_member_types[method_class][coll]` is the
+        // STORED element type — Some iff the collection holds handles).
+        let (coll, _bare, _) = self.member_coll_elem_target(coll_base)?;
+        let elem_class = self.method_class.as_deref().and_then(|cls| {
+            self.handle_member_types?
+                .get(cls)?
+                .get(coll.as_str())
+                .cloned()
+        })?;
+        // The leaf must be an admitted instance field of the ELEMENT class
+        // (statics / non-loadable / unadmitted members stay on the AST).
+        if !self.method_admission.as_ref().is_some_and(|admission| {
+            admission
+                .instance_fields
+                .get(&elem_class)
+                .is_some_and(|fields| fields.contains(member))
+        }) {
+            return None;
+        }
+        // Lower `m[k]` to the element's heap-handle register, then read
+        // `member` off it. `compile_member_coll_elem_read` takes the indexed
+        // BASE (`Ident(m)`, not the whole Index expr) + index and yields the
+        // element value (a class handle here).
+        let handle_reg = self.compile_member_coll_elem_read(coll_base, index, 0)?;
+        let dest = self.alloc_reg();
+        self.emit(Insn::LoadClassMember(
+            dest,
+            handle_reg,
+            member.to_string().into_boxed_str(),
+        ));
+        Some(dest)
+    }
+
     /// class-perf method-mode: when `base` denotes the receiving object
     /// (`this`) or a method-local CLASS HANDLE, return the VM register whose
     /// value is that object's heap handle — the base register for
@@ -5041,6 +5443,38 @@ impl<'a> BytecodeCompiler<'a> {
     /// interpreter's per-call `@name#id` storage key (`dyn_name_lookup`).
     fn local_coll_key(name: &str) -> String {
         format!("\u{1}{}", name)
+    }
+
+    /// class-perf collection-return store: the `local_coll_key` of a BARE
+    /// local collection (`q`, a queue / unsized dynamic array declared in
+    /// this method body): a one-segment Ident with no selects and no scope
+    /// root, whose runtime store is the per-call `@name#id` key. Any other
+    /// target yields None and keeps the AST fallback path.
+    fn local_coll_lhs_key(&self, lvalue: &Expression) -> Option<String> {
+        match &lvalue.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && self.local_coll_names.contains(h.path[0].name.name.as_str()) =>
+            {
+                Some(Self::local_coll_key(h.path[0].name.name.as_str()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The result register of a call instruction (the insns whose exec arms
+    /// record a returned collection in `vm_ret_coll`).
+    fn call_insn_dest(insn: &Insn) -> Option<RegId> {
+        match insn {
+            Insn::CallMethod(d, ..)
+            | Insn::CallScopedMethod(d, ..)
+            | Insn::CallFreeFunction(d, ..)
+            | Insn::CallStaticScoped(d, ..)
+            | Insn::CallCollMethod(d, ..) => Some(*d),
+            _ => None,
+        }
     }
 
     /// Split a marked local-collection key back to the bare name.
@@ -5532,11 +5966,53 @@ impl<'a> BytecodeCompiler<'a> {
     ) -> bool {
         const MAX_PURITY_DEPTH: u32 = 8;
         if self.purity_depth.get() >= MAX_PURITY_DEPTH {
+            self.purity_cut.set(true);
             return false;
         }
+        let facts = self.method_admission.as_ref().map(|a| &a.fn_facts);
+        let key = (
+            fd.name.name.name.clone(),
+            fd.span.start,
+            fd.span.end,
+            prefix.map(str::to_string),
+            allow_ext_reads,
+        );
+        if let Some(hit) = facts.and_then(|f| f.pure.borrow().get(&key).copied()) {
+            return hit;
+        }
+        let outer_cut = self.purity_cut.replace(false);
         self.purity_depth.set(self.purity_depth.get() + 1);
         let ok = self.fn_is_pure_in_inner(fd, prefix, allow_ext_reads);
         self.purity_depth.set(self.purity_depth.get() - 1);
+        let cut = self.purity_cut.get();
+        // `true` holds at any depth; `false` only when no nested check was
+        // cut off by the depth limit (asked again higher up, it could pass).
+        if (ok || !cut)
+            && let Some(f) = facts
+        {
+            f.pure.borrow_mut().insert(key, ok);
+        }
+        self.purity_cut.set(outer_cut || cut);
+        ok
+    }
+
+    /// `compile_pure_call`'s external-read admission: a callee with no
+    /// instance-qualified (`<inst>.name`) twin in the function table.
+    fn callee_ext_reads_ok(&self, name: &str) -> bool {
+        if name.contains('.') {
+            return true;
+        }
+        let facts = self.method_admission.as_ref().map(|a| &a.fn_facts);
+        if let Some(hit) = facts.and_then(|f| f.ext_reads_ok.borrow().get(name).copied()) {
+            return hit;
+        }
+        let ok = self.functions.is_some_and(|f| {
+            let suffix = format!(".{}", name);
+            !f.keys().any(|k| k.ends_with(suffix.as_str()))
+        });
+        if let Some(f) = facts {
+            f.ext_reads_ok.borrow_mut().insert(name.to_string(), ok);
+        }
         ok
     }
 
@@ -5546,6 +6022,21 @@ impl<'a> BytecodeCompiler<'a> {
         prefix: Option<&str>,
         allow_ext_reads: bool,
     ) -> bool {
+        // A DPI IMPORT function (`import "DPI-C" function string f(...);`)
+        // has NO body: it is a foreign call the compiled path cannot inline
+        // or const-fold. An empty body used to look "vacuously pure", so a
+        // wrapper like uvm_dpi_get_next_arg inlined it to a constant and
+        // every call returned garbage/empty strings (uvm_complete_test:
+        // the +UVM_TESTNAME cmdline scan read an empty string and run_test
+        // never saw the test name). Treat a body-less function as impure —
+        // the call stays on the interpreter, which performs the DPI call.
+        if self
+            .dpi_import_fds
+            .as_deref()
+            .is_some_and(|m| m.contains_key(&fd.name.name.name))
+        {
+            return false;
+        }
         let mut bound: HashSet<String> = HashSet::default();
         bound.insert(fd.name.name.name.clone());
         for p in &fd.ports {
@@ -5661,19 +6152,81 @@ impl<'a> BytecodeCompiler<'a> {
                         return false;
                     }
                     let name = BytecodeCompiler::hier_raw_name(h);
-                    let Some(fd2) = me.functions.and_then(|f| {
+                    if let Some(fd2) = me.functions.and_then(|f| {
                         f.get(&name)
                             .or_else(|| name.rsplit('.').next().and_then(|leaf| f.get(leaf)))
-                    }) else {
+                    }) {
+                        // Input-only callees here (an output arg would write a
+                        // caller name this walker cannot track). A callee that
+                        // is not itself inlinable may still be DELEGATED to the
+                        // interpreter via CallFreeFunction (impure body, or a
+                        // `string` formal the inline shape rejects): scalar
+                        // inputs with arity ≤ ports is delegatable, so the
+                        // caller stays compilable. §13.5.4 named actuals are
+                        // normalized to positional order first.
+                        let owned;
+                        let args = if args
+                            .iter()
+                            .any(|a| matches!(a.kind, ExprKind::NamedArg { .. } | ExprKind::Empty))
+                        {
+                            let Some(v) =
+                                crate::compiler::simulator::Simulator::normalize_call_args(
+                                    &fd2.ports, args,
+                                )
+                            else {
+                                return false;
+                            };
+                            owned = v;
+                            owned.as_slice()
+                        } else {
+                            args
+                        };
+                        let input_only = fd2
+                            .ports
+                            .iter()
+                            .all(|p| matches!(p.direction, PortDirection::Input));
+                        let scalar_ports = fd2.ports.iter().all(|p| p.dimensions.is_empty());
+                        let arity_le = fd2.ports.len() >= args.len();
+                        let args_ok = args.iter().all(|a| expr_ok(a, bound, me, ext));
+                        return input_only
+                            && args_ok
+                            // Delegation (CallFreeFunction) exists in method
+                            // mode only; module code keeps inlining pure
+                            // callees alone.
+                            && ((me.method_mode && scalar_ports && arity_le) || me.fn_is_pure(fd2));
+                    }
+                    // Not a declared function — a DPI IMPORT is still a
+                    // legitimate callee: the interpreter executes it through
+                    // exec_dpi_import_call and the compiled body lowers it to
+                    // a CallFreeFunction whose exec arm falls back to the DPI
+                    // dispatch. Treat the import as a leaf: input-only ports,
+                    // argument-contained actuals; an `output` formal only
+                    // when its actual is a plain assignable lvalue (the
+                    // copyback target).
+                    let Some(idf) = me
+                        .dpi_import_fds
+                        .as_deref()
+                        .and_then(|m| m.get(&name))
+                        .cloned()
+                    else {
                         return false;
                     };
-                    // Input-only callees here (an output arg would write a
-                    // caller name this walker cannot track).
-                    fd2.ports
-                        .iter()
-                        .all(|p| matches!(p.direction, PortDirection::Input))
-                        && args.iter().all(|a| expr_ok(a, bound, me, ext))
-                        && me.fn_is_pure(fd2)
+                    let normalized = crate::compiler::simulator::Simulator::normalize_call_args(
+                        &idf.ports, args,
+                    );
+                    let args = normalized.as_deref().unwrap_or(args);
+                    idf.ports.len() == args.len()
+                        && idf.ports.iter().zip(args).all(|(p, a)| match p.direction {
+                            PortDirection::Input => expr_ok(a, bound, me, ext),
+                            PortDirection::Output => matches!(
+                                &a.kind,
+                                ExprKind::Ident(h)
+                                    if h.root.is_none()
+                                        && h.path.len() == 1
+                                        && h.path[0].selects.is_empty()
+                            ),
+                            _ => false,
+                        })
                 }
                 // §10.9.2: a pattern builds its value from nothing but the
                 // expressions inside it, so it is exactly as pure as they are.
@@ -5705,6 +6258,12 @@ impl<'a> BytecodeCompiler<'a> {
         ) -> bool {
             match &st.kind {
                 StatementKind::Null => true,
+                // §6.21: a `static` local keeps its value from one call to
+                // the next; an inlined copy would start from scratch.
+                StatementKind::VarDecl {
+                    lifetime: Some(crate::ast::types::Lifetime::Static),
+                    ..
+                } => false,
                 StatementKind::VarDecl { declarators, .. } => {
                     for d in declarators {
                         if let Some(e) = &d.init {
@@ -5725,6 +6284,17 @@ impl<'a> BytecodeCompiler<'a> {
                     expr_ok(lvalue, bound, me, false) && expr_ok(rvalue, bound, me, ext)
                 }
                 StatementKind::Return(e) => e.as_ref().is_none_or(|e| expr_ok(e, bound, me, ext)),
+                // A void call in statement position (`uvm_report_error(...)`)
+                // is as pure as the expression walker says: an inlinable,
+                // delegatable (scalar-input) or DPI-import callee is a leaf.
+                // Method bodies only: module code inlines as before.
+                StatementKind::Expr(e) if me.method_mode => {
+                    let mut e = e;
+                    while let ExprKind::Paren(inner) = &e.kind {
+                        e = inner;
+                    }
+                    expr_ok(e, bound, me, ext)
+                }
                 StatementKind::While { condition, body } => {
                     // Same gap as the Foreach arm (issue #146): no arm meant
                     // `_ => false`, branding a pure while-loop helper
@@ -6155,7 +6725,7 @@ impl<'a> BytecodeCompiler<'a> {
             match self.compile_expr(a, 0) {
                 Some(r) => regs.push(r),
                 None => {
-                    self.insns.truncate(start);
+                    self.truncate_insns(start);
                     self.next_reg = start_reg;
                     return None;
                 }
@@ -6391,6 +6961,21 @@ impl<'a> BytecodeCompiler<'a> {
 
     fn emit(&mut self, insn: Insn) {
         self.insns.push(insn);
+    }
+
+    /// Discard speculative instructions together with their pending jump
+    /// fixups. A return, break or continue emitted by a failed lowering must
+    /// not patch discarded code when an enclosing function or loop finishes.
+    fn truncate_insns(&mut self, len: usize) {
+        self.insns.truncate(len);
+        self.inline_ret_jumps.retain(|&pc| pc < len);
+        self.method_ret_jumps.retain(|&pc| pc < len);
+        for patches in &mut self.loop_break_patches {
+            patches.retain(|&pc| pc < len);
+        }
+        for patches in &mut self.loop_continue_patches {
+            patches.retain(|&pc| pc < len);
+        }
     }
 
     /// `hier_raw_name`, borrowed when the path has a single segment.
@@ -6703,12 +7288,12 @@ impl<'a> BytecodeCompiler<'a> {
                 if Self::hier_raw_name(lh) != vname {
                     return false;
                 }
-                let Some(c) = self.fold_const(right).and_then(|v| v.to_u64()) else {
+                let Some(c) = self.fold_const(right).and_then(|v| v.to_i64()) else {
                     return false;
                 };
                 match op {
-                    BinaryOp::Add => c as i64,
-                    BinaryOp::Sub => -(c as i64),
+                    BinaryOp::Add => c,
+                    BinaryOp::Sub => c.wrapping_neg(),
                     _ => return false,
                 }
             }
@@ -6717,10 +7302,33 @@ impl<'a> BytecodeCompiler<'a> {
         if step_delta == 0 {
             return false;
         }
+        // The loop variable is bound with its declared width and signedness
+        // (§6.11, §6.8): the condition compares it as signed when both
+        // operands are signed (§11.8.1), so `for (int i = 1; i > -1; i--)`
+        // needs `i` signed, and the step wraps at the declared width.
+        let kind = self.local_kind_of(data_type, None);
+        let Some(LocalKind::Int { width, signed, .. }) = kind else {
+            return false;
+        };
+        if width == 0 || width > 64 {
+            return false;
+        }
+        let fit = |x: i64| -> i64 {
+            if width == 64 {
+                return x;
+            }
+            let mask = (1u64 << width) - 1;
+            let u = (x as u64) & mask;
+            if signed && (u >> (width - 1)) & 1 == 1 {
+                (u | !mask) as i64
+            } else {
+                u as i64
+            }
+        };
         let Some(mut cur) = self
             .fold_const(init)
-            .and_then(|v| v.to_u64())
-            .map(|v| v as i64)
+            .and_then(|v| if v.has_xz() { None } else { v.to_i64() })
+            .map(fit)
         else {
             return false;
         };
@@ -6729,16 +7337,26 @@ impl<'a> BytecodeCompiler<'a> {
         let start_reg = self.next_reg;
         let outer_const = self.local_const_vars.remove(&vname);
         // How a fallback in the body hands the constant to the interpreter.
-        let kind = self.local_kind_of(data_type, None);
-        let outer_kind = match kind {
-            Some(k) => self.local_const_kinds.insert(vname.clone(), k),
-            None => self.local_const_kinds.remove(&vname),
-        };
+        let outer_kind = self.local_const_kinds.insert(
+            vname.clone(),
+            LocalKind::Int {
+                width,
+                signed,
+                two_state: matches!(
+                    kind,
+                    Some(LocalKind::Int {
+                        two_state: true,
+                        ..
+                    })
+                ),
+            },
+        );
         let mut ok = true;
         let mut trips = 0usize;
         loop {
-            self.local_const_vars
-                .insert(vname.clone(), Value::from_u64(cur as u64, 32));
+            let mut bound = Value::from_u64(cur as u64, width);
+            bound.is_signed = signed;
+            self.local_const_vars.insert(vname.clone(), bound);
             let c = match self.fold_const(cond) {
                 Some(v) => v.is_true(),
                 None => {
@@ -6763,7 +7381,7 @@ impl<'a> BytecodeCompiler<'a> {
                 ok = false;
                 break;
             }
-            cur += step_delta;
+            cur = fit(cur.wrapping_add(step_delta));
         }
         self.local_const_vars.remove(&vname);
         if let Some(v) = outer_const {
@@ -6778,7 +7396,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         if !ok {
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
             return false;
         }
@@ -7107,7 +7725,7 @@ impl<'a> BytecodeCompiler<'a> {
             lvalue, acc_expr, e, &op, acc_id, k_sig, k_init, k_w, &vals, cur, &names, &kval,
         );
         if !ok {
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
         }
         ok
@@ -7402,7 +8020,14 @@ impl<'a> BytecodeCompiler<'a> {
                 let v = self.fold_const(operand)?;
                 match op {
                     UnaryOp::Plus => v,
-                    UnaryOp::Minus => Value::zero(v.width.max(32)).sub(&v),
+                    // §11.4.3/§11.8.1: negation keeps its operand's
+                    // signedness — `-1` is a signed constant, so `i > -1`
+                    // on a signed `i` compares signed.
+                    UnaryOp::Minus => {
+                        let mut r = Value::zero(v.width.max(32)).sub(&v);
+                        r.is_signed = v.is_signed;
+                        r
+                    }
                     UnaryOp::BitNot => v.bitwise_not(),
                     UnaryOp::LogNot => v.logic_not(),
                     _ => return None,
@@ -7594,7 +8219,7 @@ impl<'a> BytecodeCompiler<'a> {
         let start = self.insns.len();
         let start_reg = self.next_reg;
         let Some(sel) = self.compile_expr(expr, 0) else {
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
             return false;
         };
@@ -7636,7 +8261,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.next_reg = arm_reg_start;
         }
         if !ok {
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
             return false;
         }
@@ -7652,7 +8277,7 @@ impl<'a> BytecodeCompiler<'a> {
         if let Ok(lim) = std::env::var("XEZIM_CASEJUMP_LIMIT") {
             if let Ok(lim) = lim.parse::<usize>() {
                 if n >= lim {
-                    self.insns.truncate(start);
+                    self.truncate_insns(start);
                     self.next_reg = start_reg;
                     return false;
                 }
@@ -7794,7 +8419,7 @@ impl<'a> BytecodeCompiler<'a> {
         let start = self.insns.len();
         let start_reg = self.next_reg;
         let Some(sel) = self.compile_expr(expr, 0) else {
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
             return false;
         };
@@ -7916,7 +8541,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         if !ok {
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
             return false;
         }
@@ -7989,6 +8614,247 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         Some(v)
+    }
+
+    /// §11.8.2: true when `e` is REAL-typed by declaration — a real literal, a
+    /// real variable, a real-valued system function, a cast to a real type,
+    /// or an arithmetic/conditional operator over such an operand. Exact,
+    /// unlike `expr_may_be_real`: it decides how the OTHER operand of a real
+    /// operator is evaluated, so a shape it cannot type answers false and
+    /// keeps the integral rules.
+    fn expr_is_real_static(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(n) => matches!(n, NumberLiteral::Real(_) | NumberLiteral::Time(_)),
+            ExprKind::Ident(h) => {
+                self.local_var_is_real.contains(&Self::hier_raw_name(h))
+                    || self.lookup_signal_id(h).is_some_and(|id| {
+                        self.signal_real
+                            .is_some_and(|r| r.get(id).copied().unwrap_or(false))
+                    })
+            }
+            ExprKind::Paren(x) => self.expr_is_real_static(x),
+            ExprKind::Unary {
+                op: UnaryOp::Plus | UnaryOp::Minus,
+                operand,
+            } => self.expr_is_real_static(operand),
+            ExprKind::Binary {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Power,
+                left,
+                right,
+            } => self.expr_is_real_static(left) || self.expr_is_real_static(right),
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => self.expr_is_real_static(then_expr) || self.expr_is_real_static(else_expr),
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$__xz_type_cast" => matches!(
+                    args.first().map(|a| &a.kind),
+                    Some(ExprKind::TypeLiteral(dt))
+                        if crate::compiler::elaborate::is_type_real(dt)
+                ),
+                n => system_function_is_real(n),
+            },
+            _ => false,
+        }
+    }
+
+    /// §10.7/§11.8.2: the context width an assignment gives its right-hand
+    /// side. A REAL target has no bit width to lend: an integral RHS is
+    /// evaluated self-determined and then converted (`r = u - 2` with
+    /// `int unsigned u = 1` is 4294967295.0, `r = x + 1` wraps at 32 bits).
+    fn assign_rhs_ctx(&self, lvalue: &Expression, width: u32) -> u32 {
+        if matches!(lvalue.kind, ExprKind::Ident(_)) && self.expr_is_real_static(lvalue) {
+            0
+        } else {
+            width
+        }
+    }
+
+    /// A constant expression by its shape — literals, parameters, and
+    /// operators, casts and real conversions over them.
+    fn expr_is_constant(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(_) => true,
+            ExprKind::Ident(h) => self.lookup_param_value(h).is_some(),
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => self.expr_is_constant(x),
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_is_constant(left) && self.expr_is_constant(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_is_constant(condition)
+                    && self.expr_is_constant(then_expr)
+                    && self.expr_is_constant(else_expr)
+            }
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$__xz_type_cast" => args.get(1).is_some_and(|a| self.expr_is_constant(a)),
+                n if n != "$realtime" && system_function_is_real(n) => {
+                    args.iter().all(|a| self.expr_is_constant(a))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// §11.8.2 operators with a REAL operand. Neither operand real: None, and
+    /// the integral rules apply. Otherwise:
+    /// - an arithmetic operator's result is real, so each integral operand is
+    ///   evaluated SELF-determined and then converted. The surrounding context
+    ///   width never reaches it — `(u - 2) * 1.0` with `int unsigned u = 1`
+    ///   converts the 32-bit 4294967295, not a 64-bit all-ones;
+    /// - a relational or equality operator's operands take real type from
+    ///   each other, so the real type propagates ONE operator into the
+    ///   integral side, whose own operands are then self-determined (see
+    ///   `compile_in_real_context`): `3.5 == 7/2` compares 3.5 with 3.5. As
+    ///   in the reference simulator, this happens only for a constant
+    ///   integral side; a run-time one is converted whole.
+    fn compile_real_operator(
+        &mut self,
+        op: BinaryOp,
+        left: &Expression,
+        right: &Expression,
+    ) -> Option<Option<RegId>> {
+        let arith = matches!(
+            op,
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Power
+        );
+        let cmp = matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+        );
+        if !arith && !cmp {
+            return None;
+        }
+        let lr = self.expr_is_real_static(left);
+        let rr = self.expr_is_real_static(right);
+        if !lr && !rr {
+            return None;
+        }
+        // The reference simulator propagates into a comparison only when the
+        // integral side is itself CONSTANT (`3.5 == 7/2` divides as reals);
+        // a run-time integral side is converted from its self-determined
+        // value (`x == a/b` divides as integers).
+        let lp = cmp && !lr && self.expr_is_constant(left);
+        let rp = cmp && !rr && self.expr_is_constant(right);
+        let l = if lp {
+            self.compile_in_real_context(left)
+        } else {
+            self.compile_real_operand(left, lr)
+        };
+        let Some(l) = l else {
+            return Some(None);
+        };
+        let r = if rp {
+            self.compile_in_real_context(right)
+        } else {
+            self.compile_real_operand(right, rr)
+        };
+        let Some(r) = r else {
+            return Some(None);
+        };
+        Some(Some(self.emit_real_binop(op, l, r)))
+    }
+
+    /// An arm of a `?:` whose result is real: a real arm as itself, a
+    /// constant integral arm in real context, any other integral arm
+    /// converted from its self-determined value (as the reference simulator
+    /// does at run time).
+    fn compile_real_arm(&mut self, e: &Expression) -> Option<RegId> {
+        if self.expr_is_real_static(e) {
+            self.compile_expr(e, 0)
+        } else if self.expr_is_constant(e) {
+            self.compile_in_real_context(e)
+        } else {
+            self.compile_real_operand(e, false)
+        }
+    }
+
+    /// One real-operator instruction over two real registers.
+    fn emit_real_binop(&mut self, op: BinaryOp, l: RegId, r: RegId) -> RegId {
+        let dest = self.alloc_reg();
+        self.emit(match op {
+            BinaryOp::Add => Insn::Add(dest, l, r),
+            BinaryOp::Sub => Insn::Sub(dest, l, r),
+            BinaryOp::Mul => Insn::Mul(dest, l, r),
+            BinaryOp::Div => Insn::Div(dest, l, r),
+            BinaryOp::Power => Insn::Pow(dest, l, r),
+            BinaryOp::Eq => Insn::Eq(dest, l, r),
+            BinaryOp::Neq => Insn::Neq(dest, l, r),
+            BinaryOp::Lt => Insn::Lt(dest, l, r),
+            BinaryOp::Leq => Insn::Leq(dest, l, r),
+            BinaryOp::Gt => Insn::Gt(dest, l, r),
+            _ => Insn::Geq(dest, l, r),
+        });
+        dest
+    }
+
+    /// An operand of a real operator: a real operand as itself, an integral
+    /// one SELF-determined (§11.8.2) and converted to real (§6.12.2: x and z
+    /// bits read as 0). Converted in a fresh register — the operand's own
+    /// may be a local variable's.
+    fn compile_real_operand(&mut self, e: &Expression, is_real: bool) -> Option<RegId> {
+        let v = self.compile_expr(e, 0)?;
+        if is_real {
+            return Some(v);
+        }
+        let t = self.alloc_reg();
+        self.emit(Insn::Move(t, v));
+        self.emit_to_real(t);
+        Some(t)
+    }
+
+    /// §11.8.2: an integral operand that takes REAL type from its context (the
+    /// other side of a relational operator, the other arm of `?:`). The real
+    /// type reaches the operator at its top — an arithmetic one computes in
+    /// real — whose own integral operands are then self-determined and
+    /// converted. Anything else is self-determined and converted whole.
+    fn compile_in_real_context(&mut self, e: &Expression) -> Option<RegId> {
+        match &e.kind {
+            ExprKind::Paren(x) => self.compile_in_real_context(x),
+            ExprKind::Binary {
+                op:
+                    op @ (BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Power),
+                left,
+                right,
+            } => {
+                let lr = self.expr_is_real_static(left);
+                let l = self.compile_real_operand(left, lr)?;
+                let rr = self.expr_is_real_static(right);
+                let r = self.compile_real_operand(right, rr)?;
+                Some(self.emit_real_binop(*op, l, r))
+            }
+            ExprKind::Unary {
+                op: op @ (UnaryOp::Plus | UnaryOp::Minus),
+                operand,
+            } => {
+                let real = self.expr_is_real_static(operand);
+                let o = self.compile_real_operand(operand, real)?;
+                if matches!(op, UnaryOp::Plus) {
+                    return Some(o);
+                }
+                let dest = self.alloc_reg();
+                self.emit(Insn::Negate(dest, o));
+                Some(dest)
+            }
+            _ => {
+                let real = self.expr_is_real_static(e);
+                self.compile_real_operand(e, real)
+            }
+        }
     }
 
     /// Conservative: true when `e` may evaluate to a real — a real literal,
@@ -9253,6 +10119,10 @@ impl<'a> BytecodeCompiler<'a> {
         let start_reg = self.next_reg;
         let saved_reason = self.bail_reason;
         let saved_overflow = self.register_overflow;
+        let loop_depth = (
+            self.loop_break_patches.len(),
+            self.loop_continue_patches.len(),
+        );
         self.bail_reason = None;
         self.register_overflow = false;
         let strict_ok = self.compile_stmt_strict(stmt);
@@ -9261,6 +10131,9 @@ impl<'a> BytecodeCompiler<'a> {
             self.register_overflow = saved_overflow;
             return true;
         }
+        // A loop that bailed part-way may leave its own patch frames pushed.
+        self.loop_break_patches.truncate(loop_depth.0);
+        self.loop_continue_patches.truncate(loop_depth.1);
         if self.register_overflow {
             self.bail("bytecode_register_limit");
         }
@@ -9275,7 +10148,7 @@ impl<'a> BytecodeCompiler<'a> {
             let reason = self
                 .bail_reason
                 .unwrap_or_else(|| Self::stmt_kind_label(stmt));
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
             let locals = if self.fb_live() {
                 self.fb_stmt_locals(stmt)
@@ -9386,6 +10259,51 @@ impl<'a> BytecodeCompiler<'a> {
             // register's value and returns it to the caller). Trailing/jump
             // targets are back-patched like `inline_ret_jumps` below.
             StatementKind::Return(e) if self.method_mode => {
+                // class-perf collection-return: only `return '{…}` literals
+                // are admitted — each element lands in a contiguous arg slot
+                // and one `RetCollection` hands the range to the interpreter's
+                // snapshot store (mirrors the AST path's
+                // `populate_queue_from_init(RET_SNAP, e)` + pending hand-off).
+                // Any other return expression form bails — the interpreter's
+                // conversion/concat paths for queue-typed values are not
+                // reproduced.
+                if self.method_ret_is_collection {
+                    let Some(items) = e else {
+                        self.bail("Return_collection_empty");
+                        return false;
+                    };
+                    let crate::ast::expr::ExprKind::AssignmentPattern(items) = &items.kind else {
+                        self.bail("Return_collection_not_literal");
+                        return false;
+                    };
+                    let mut arg_values: Vec<RegId> = Vec::with_capacity(items.len());
+                    for item in items {
+                        let crate::ast::expr::AssignmentPatternItem::Ordered(item) = item else {
+                            self.bail("Return_collection_named_item");
+                            return false;
+                        };
+                        let Some(r) = self.compile_expr(item, 0) else {
+                            return false;
+                        };
+                        arg_values.push(r);
+                    }
+                    let n = arg_values.len() as u32;
+                    let arg_start = self.alloc_reg();
+                    for _ in 1..arg_values.len() {
+                        self.alloc_reg();
+                    }
+                    for (i, &v) in arg_values.iter().enumerate() {
+                        let slot = (arg_start as usize + i) as RegId;
+                        if slot != v {
+                            self.emit(Insn::Move(slot, v));
+                        }
+                    }
+                    self.emit(Insn::RetCollection(arg_start as u32, n));
+                    let j = self.insns.len();
+                    self.emit(Insn::Jump(0));
+                    self.method_ret_jumps.push(j);
+                    return true;
+                }
                 if let Some(e) = e {
                     let Some(rv) = self.method_return_val_reg else {
                         self.bail("Return_value_in_void");
@@ -9563,6 +10481,64 @@ impl<'a> BytecodeCompiler<'a> {
                     } else {
                         self.decl_width(data_type)
                     };
+                    // §6.21: a STATIC local persists across calls — its
+                    // declaration runs ONCE. The compiled path must NOT
+                    // seed the register (a compile-time default folds
+                    // `m_inst == null` to true and a fresh singleton is
+                    // constructed on every call); the dispatch shell seeds
+                    // it from the persistent store instead and copies the
+                    // final register back at exit. A declarator WITH an
+                    // initializer has run-once semantics the block cannot
+                    // express — bail the whole method to the AST path.
+                    if self.method_mode
+                        && matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+                    {
+                        if decl.init.is_some() {
+                            self.bail("static_local_init");
+                            return false;
+                        }
+                        let slot = self.alloc_reg();
+                        let is_real = crate::compiler::elaborate::is_type_real(data_type);
+                        let is_string = matches!(
+                            data_type,
+                            crate::ast::types::DataType::Simple {
+                                kind: crate::ast::types::SimpleType::String,
+                                ..
+                            }
+                        );
+                        let is_class_handle = self.class_local_names.contains(&decl.name.name);
+                        let (w, default) = if is_class_handle {
+                            (0, Value::zero(32))
+                        } else if is_real {
+                            (0, Value::from_f64(0.0))
+                        } else {
+                            let w = if is_string {
+                                0
+                            } else {
+                                self.decl_width(data_type)
+                            };
+                            (w, self.type_default_value(data_type, w))
+                        };
+                        if is_class_handle {
+                            self.method_handle_names.insert(decl.name.name.clone());
+                        } else {
+                            if is_real {
+                                self.local_var_is_real.insert(decl.name.name.clone());
+                            }
+                            if is_string {
+                                self.local_var_is_string.insert(decl.name.name.clone());
+                            }
+                            if let Some(k) = self.local_kind_of(data_type, None) {
+                                self.local_kinds.insert(slot, k);
+                            }
+                        }
+                        self.local_var_regs
+                            .insert(decl.name.name.clone(), (slot, w));
+                        self.decl_local_regs.insert(decl.name.name.clone());
+                        self.method_static_locals
+                            .push((decl.name.name.clone(), slot, default));
+                        continue;
+                    }
                     // Step 6: a CLASS-typed local holds a heap HANDLE in a
                     // register — default null (0), no resize (handles
                     // round-trip untouched), and the name joins
@@ -9657,7 +10633,8 @@ impl<'a> BytecodeCompiler<'a> {
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
                 self.pattern_layout = self.lvalue_struct_layout(lvalue);
-                let compiled = self.compile_expr(rvalue, width);
+                let rctx = self.assign_rhs_ctx(lvalue, width);
+                let compiled = self.compile_expr(rvalue, rctx);
                 self.pattern_layout = None;
                 if let Some(val_reg) = compiled {
                     // Note: NbaAssign itself performs §10.7 assignment-padding resize,
@@ -9671,7 +10648,7 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("nba_rvalue");
                 }
                 // Roll back partial work and emit fallback if allowed.
-                self.insns.truncate(start);
+                self.truncate_insns(start);
                 self.next_reg = start_reg;
                 self.emit_fallback(stmt)
             }
@@ -9722,7 +10699,7 @@ impl<'a> BytecodeCompiler<'a> {
                     {
                         return true;
                     }
-                    self.insns.truncate(start);
+                    self.truncate_insns(start);
                     self.next_reg = start_reg;
                     // Fall through to the AST fallback below.
                     self.bail("coll_elem_store");
@@ -9744,10 +10721,32 @@ impl<'a> BytecodeCompiler<'a> {
                 let compiled = if let Some(cls) = new_cls {
                     self.compile_new_construct(rvalue, &cls)
                 } else {
-                    self.compile_expr(rvalue, width)
+                    let rctx = self.assign_rhs_ctx(lvalue, width);
+                    self.compile_expr(rvalue, rctx)
                 };
                 self.pattern_layout = None;
                 if let Some(val_reg) = compiled {
+                    // class-perf collection-return store (§13.4):
+                    // `q_local = coll_fn(..)`. The callee hands a queue /
+                    // array result through the `pending_ret_collection` side
+                    // channel, which the call's exec arm records in
+                    // `vm_ret_coll`; AssignPendingColl copies it whole into
+                    // the local (or assigns the scalar result when nothing was
+                    // handed back). Only when the value register is the
+                    // result of the LAST call instruction emitted for the
+                    // RHS, so the recorded collection is this call's.
+                    if self.method_mode
+                        && matches!(rvalue.kind, ExprKind::Call { .. })
+                        && let Some(key) = self.local_coll_lhs_key(lvalue)
+                        && self.insns[start..]
+                            .iter()
+                            .rev()
+                            .find_map(Self::call_insn_dest)
+                            == Some(val_reg)
+                    {
+                        self.emit(Insn::AssignPendingColl(key.into_boxed_str(), val_reg));
+                        return true;
+                    }
                     if width > 0 && !via_new {
                         self.emit(Insn::Resize(val_reg, width));
                     }
@@ -9773,7 +10772,7 @@ impl<'a> BytecodeCompiler<'a> {
                 } else {
                     self.bail("blocking_rvalue");
                 }
-                self.insns.truncate(start);
+                self.truncate_insns(start);
                 self.next_reg = start_reg;
                 self.emit_fallback(stmt)
             }
@@ -10081,7 +11080,7 @@ impl<'a> BytecodeCompiler<'a> {
                             if lowered == Some(()) {
                                 return true;
                             }
-                            self.insns.truncate(start);
+                            self.truncate_insns(start);
                             self.next_reg = start_reg;
                         }
                         self.bail("Expr_PreIncr");
@@ -10139,7 +11138,7 @@ impl<'a> BytecodeCompiler<'a> {
                             if lowered == Some(()) {
                                 return true;
                             }
-                            self.insns.truncate(start);
+                            self.truncate_insns(start);
                             self.next_reg = start_reg;
                         }
                         self.bail("Expr_PreDecr");
@@ -10194,7 +11193,7 @@ impl<'a> BytecodeCompiler<'a> {
                                         return true;
                                     }
                                 }
-                                self.insns.truncate(start);
+                                self.truncate_insns(start);
                                 self.next_reg = start_reg;
                                 // fall through to the task/AST paths
                             }
@@ -10240,6 +11239,34 @@ impl<'a> BytecodeCompiler<'a> {
                         return self.emit_fallback(stmt);
                     }
                     _ => {}
+                }
+                // Void diagnostic system tasks ($display family, $finish,
+                // $stop): they never produce a value, so route them through
+                // the AST-fallback insn — the runtime interpreter prints
+                // byte-identical output. Method bodies only (their
+                // allow_ast_fallback is off, deliberately not consulted here:
+                // these are leaf statements with no control-flow effect);
+                // module code keeps `emit_fallback` below.
+                if self.method_mode
+                    && let ExprKind::SystemCall { name, .. } = &e.kind
+                    && matches!(
+                        name.as_str(),
+                        "$display" | "$write" | "$strobe" | "$monitor" | "$finish" | "$stop"
+                    )
+                {
+                    let locals = if self.fb_live() {
+                        match self.fb_stmt_locals(stmt) {
+                            Ok(l) => l,
+                            Err(why) => {
+                                self.bail(why);
+                                return false;
+                            }
+                        }
+                    } else {
+                        FbLocals::default()
+                    };
+                    self.push_stmt_fallback(stmt, "Expr_syscall_void", locals);
+                    return true;
                 }
                 let n: &'static str = match &e.kind {
                     ExprKind::SystemCall { name, .. } => match name.as_str() {
@@ -10437,6 +11464,55 @@ impl<'a> BytecodeCompiler<'a> {
                             self.for_loop_var_ids = saved_for_vars;
                             self.local_var_regs = saved_locals;
                             return true;
+                        }
+                        #[allow(unreachable_patterns)]
+                        ForInit::VarDecl {
+                            data_type,
+                            name,
+                            init,
+                        } if self.method_mode => {
+                            // General loop-scoped declaration (METHOD bodies
+                            // only): bind the induction variable to a plain
+                            // register (no reg-bank fast path, no unrolling)
+                            // and let the ordinary loop skeleton below drive
+                            // it. Module-process loops keep the AST path —
+                            // exec_statement's vectorized collapses (packed
+                            // fill / copy, fused array NBA) fire there and a
+                            // compiled loop would bypass them.
+                            let w = self.decl_width(data_type);
+                            let slot = self.alloc_reg();
+                            let Some(v) = self.compile_expr(init, w) else {
+                                self.for_loop_var_ids = saved_for_vars;
+                                self.local_var_regs = saved_locals;
+                                self.bail("For_init_vardecl_rvalue");
+                                return false;
+                            };
+                            self.emit(Insn::Move(slot, v));
+                            if w > 0 {
+                                self.emit(Insn::Resize(slot, w));
+                            }
+                            use crate::ast::types::{
+                                DataType as GDt, IntegerAtomType as GIat, Signing as GSg,
+                            };
+                            let decl_signed = match data_type {
+                                GDt::IntegerAtom { kind, signing, .. } => {
+                                    !matches!(signing, Some(GSg::Unsigned))
+                                        && !matches!(kind, GIat::Time)
+                                }
+                                GDt::IntegerVector { signing, .. } => {
+                                    matches!(signing, Some(GSg::Signed))
+                                }
+                                _ => false,
+                            };
+                            if decl_signed {
+                                self.emit(Insn::SetSigned(slot));
+                            } else {
+                                self.emit(Insn::ClearSigned(slot));
+                            }
+                            if let Some(k) = self.local_kind_of(data_type, None) {
+                                self.local_kinds.insert(slot, k);
+                            }
+                            self.local_var_regs.insert(name.name.clone(), (slot, w));
                         }
                         #[allow(unreachable_patterns)]
                         ForInit::VarDecl { .. } => {
@@ -10915,7 +11991,7 @@ impl<'a> BytecodeCompiler<'a> {
             match self.compile_expr(a, 0) {
                 Some(r) => arg_values.push(r),
                 None => {
-                    self.insns.truncate(call_start);
+                    self.truncate_insns(call_start);
                     self.next_reg = call_next;
                     self.bail("Expr_New_args");
                     return None;
@@ -11127,6 +12203,26 @@ impl<'a> BytecodeCompiler<'a> {
                             self.bail("Expr_New");
                             return None;
                         }
+                        // class-perf free-function tier: a free (package/
+                        // module-scope) function frame has NO class scope —
+                        // every bare name that is not a formal/local/return
+                        // cell resolves, in the interpreter, to a
+                        // package-level VARIABLE (assoc arrays, queues,
+                        // state objects: uvm_globals' `m_uvm_core_state`
+                        // and friends). Those live outside the signal
+                        // table (or with unrelated storage), and a compiled
+                        // block reading them as module signals returned
+                        // garbage that corrupted the whole UVM init
+                        // sequence (uvm_complete_test: run_test silently
+                        // produced nothing). Decline the body unless every
+                        // such name was explicitly admitted.
+                        if self.free_function_mode
+                            && !self.method_handle_names.contains(bare)
+                            && !self.string_formal_names.contains(bare)
+                        {
+                            self.bail("free_fn_pkg_variable");
+                            return None;
+                        }
                     }
                 }
                 if let Some(id) = self.lookup_signal_id(hier) {
@@ -11220,7 +12316,7 @@ impl<'a> BytecodeCompiler<'a> {
                     if let Some(out) = lowered {
                         return Some(out);
                     }
-                    self.insns.truncate(start);
+                    self.truncate_insns(start);
                     self.next_reg = start_reg;
                     self.bail("Expr_IncrExpr");
                     return None;
@@ -11313,6 +12409,11 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     self.bail("string_formal_non_eq_binary");
                     return None;
+                }
+                // §11.8.2: an operator with a REAL operand follows the real
+                // rules, not the integral width/sign propagation below.
+                if let Some(r) = self.compile_real_operator(*op, left, right) {
+                    return r;
                 }
                 // Verilog operand-width rules: comparison and logical ops
                 // (==, !=, <, <=, >, >=, &&, ||, ===, !==, case-eq) are
@@ -11620,6 +12721,16 @@ impl<'a> BytecodeCompiler<'a> {
                 then_expr,
                 else_expr,
             } => {
+                // §11.4.11/§11.8.2: with a REAL arm the result is real and no
+                // context width applies; see `compile_real_arm`.
+                if self.expr_is_real_static(then_expr) || self.expr_is_real_static(else_expr) {
+                    let cond = self.compile_expr(condition, 0)?;
+                    let then_reg = self.compile_real_arm(then_expr)?;
+                    let else_reg = self.compile_real_arm(else_expr)?;
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::Select(dest, cond, then_reg, else_reg));
+                    return Some(dest);
+                }
                 // Evaluate both branches unconditionally so Select can do a
                 // per-bit merge when the condition has X/Z (IEEE 1800 §11.4.11).
                 let cond = self.compile_expr(condition, 0)?;
@@ -11735,7 +12846,7 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(dest) = self.compile_packed_member_index(expr, index) {
                     return Some(dest);
                 }
-                self.insns.truncate(member_start);
+                self.truncate_insns(member_start);
                 self.next_reg = member_reg;
                 // §7.4.1 CHAINED packed element select — `v[i][j][k]` on
                 // `logic [0:0][1:0][1:0]`. Only the innermost `Index` has an
@@ -11987,7 +13098,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // right when it really is a scalar, so hand the interpreter
                 // the whole select instead.
                 if self.sel_base_is_interpreted(base_start, expr) {
-                    self.insns.truncate(base_start);
+                    self.truncate_insns(base_start);
                     self.next_reg = base_reg;
                     if let Some(r) =
                         self.emit_expr_fallback(whole, ctx_width, "sel_base_interpreted")
@@ -12050,7 +13161,7 @@ impl<'a> BytecodeCompiler<'a> {
                     // right when it really is a scalar, so hand the interpreter
                     // the whole select instead.
                     if self.sel_base_is_interpreted(base_start, expr) {
-                        self.insns.truncate(base_start);
+                        self.truncate_insns(base_start);
                         self.next_reg = base_reg;
                         if let Some(r) =
                             self.emit_expr_fallback(whole, ctx_width, "sel_base_interpreted")
@@ -12147,7 +13258,7 @@ impl<'a> BytecodeCompiler<'a> {
                     // is only right when it really is a scalar, so hand the
                     // interpreter the whole select instead.
                     if self.sel_base_is_interpreted(base_start, expr) {
-                        self.insns.truncate(base_start);
+                        self.truncate_insns(base_start);
                         self.next_reg = base_reg;
                         if let Some(r) =
                             self.emit_expr_fallback(whole, ctx_width, "sel_base_interpreted")
@@ -12288,7 +13399,7 @@ impl<'a> BytecodeCompiler<'a> {
                             self.emit(Insn::StrOp(dst, StrOpKind::Concat, Box::new(regs)));
                             return Some(dst);
                         }
-                        self.insns.truncate(start);
+                        self.truncate_insns(start);
                         self.next_reg = start_reg;
                     }
                     self.bail("Concat_string");
@@ -12461,7 +13572,7 @@ impl<'a> BytecodeCompiler<'a> {
                                 if ok {
                                     native = Some((segs, arg_regs));
                                 } else {
-                                    self.insns.truncate(start);
+                                    self.truncate_insns(start);
                                     self.next_reg = start_reg;
                                 }
                             }
@@ -12556,8 +13667,12 @@ impl<'a> BytecodeCompiler<'a> {
                         _ => None,
                     });
                     if let Some(w) = w.filter(|&w| w > 0) {
+                        // §20.6.2: `$bits` returns an `integer` — signed,
+                        // so `$bits(a) - 200` is negative, not 2**32 - 72.
+                        let mut c = Value::from_u64(w as u64, 32);
+                        c.is_signed = true;
                         let r = self.alloc_reg();
-                        self.emit(Insn::LoadConst(r, Box::new(Value::from_u64(w as u64, 32))));
+                        self.emit(Insn::LoadConst(r, Box::new(c)));
                         Some(r)
                     } else {
                         if let Some(r) = self.emit_expr_fallback(expr, ctx_width, "SystemCall_bits")
@@ -12762,6 +13877,14 @@ impl<'a> BytecodeCompiler<'a> {
                 // bound as a CLASS HANDLE qualifies; anything else keeps the
                 // pre-existing (signal/struct) paths below.
                 if self.method_mode {
+                    // class-perf: a member read rooted at an ELEMENT of a
+                    // class-handle member collection (`m[k].data`,
+                    // `this.aa[k].field`). Checked before the handle-chain
+                    // path and the signal/struct arms below, which cannot
+                    // resolve an indexed collection receiver.
+                    if let Some(dest) = self.compile_member_handle_elem_member(base, &member.name) {
+                        return Some(dest);
+                    }
                     // Step 6: the base may be a whole chain (`a.b`,
                     // `this.m_parent`, a bare member) — lower it to its
                     // handle register first, then read `member` off that
@@ -12815,7 +13938,7 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(dest) = self.compile_indexed_packed_member(base, &member.name) {
                     return Some(dest);
                 }
-                self.insns.truncate(member_start);
+                self.truncate_insns(member_start);
                 self.next_reg = member_reg;
                 // `b.descriptors[0].region` parses with the element select on
                 // the LAST path segment (`b.descriptors[0]` is one identifier):
@@ -12838,7 +13961,7 @@ impl<'a> BytecodeCompiler<'a> {
                         return Some(dest);
                     }
                 }
-                self.insns.truncate(member_start);
+                self.truncate_insns(member_start);
                 self.next_reg = member_reg;
 
                 // Direct packed member (`container.field`). Nested field paths
@@ -12853,7 +13976,7 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit(Insn::RangeSelectConst(dest, root, *off + *width - 1, *off));
                     return Some(dest);
                 }
-                self.insns.truncate(direct_start);
+                self.truncate_insns(direct_start);
                 self.next_reg = direct_reg;
                 // class-perf P2: a PACKAGE-scope enum constant parsed as
                 // MemberAccess (`pk::LOW` in an argument). Same fold as the
@@ -13067,7 +14190,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit_arg_slot_writeback(args, arg_start, Some(&member.name))?;
                         return Some(dest);
                     }
-                    self.insns.truncate(call_start);
+                    self.truncate_insns(call_start);
                     self.next_reg = call_next;
                     self.bail("Expr_Call_super");
                     return None;
@@ -13134,17 +14257,43 @@ impl<'a> BytecodeCompiler<'a> {
                                 self.emit(Insn::Move(slot, v));
                             }
                         }
-                        self.emit(Insn::CallMethod(
-                            dest,
-                            handle_reg,
-                            Box::new(Name(member.name.clone().into_boxed_str())),
-                            arg_start,
-                            n,
-                        ));
+                        // §8.20: a non-virtual method binds to the
+                        // receiver's DECLARED class; CallMethod dispatches on
+                        // the object's dynamic class, which differs only when
+                        // a subclass redeclares the method. Those calls start
+                        // the hierarchy walk at the statically bound class.
+                        let static_target = self.method_handle_chain_class(base).and_then(|rc| {
+                            self.method_admission.as_ref().and_then(|a| {
+                                a.nonvirtual_targets
+                                    .get(rc.split('#').next().unwrap_or(&rc))
+                                    .and_then(|m| m.get(member.name.as_str()))
+                                    .cloned()
+                            })
+                        });
+                        if let Some(target) = static_target {
+                            self.emit(Insn::CallScopedMethod(
+                                dest,
+                                handle_reg,
+                                Box::new(NamePair(
+                                    target.into_boxed_str(),
+                                    member.name.clone().into_boxed_str(),
+                                )),
+                                arg_start,
+                                n,
+                            ));
+                        } else {
+                            self.emit(Insn::CallMethod(
+                                dest,
+                                handle_reg,
+                                Box::new(Name(member.name.clone().into_boxed_str())),
+                                arg_start,
+                                n,
+                            ));
+                        }
                         self.emit_arg_slot_writeback(args, arg_start, Some(&member.name))?;
                         return Some(dest);
                     }
-                    self.insns.truncate(call_start);
+                    self.truncate_insns(call_start);
                     self.next_reg = call_next;
                     self.bail("Expr_Call_class_method");
                     return None;
@@ -13247,7 +14396,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit_arg_slot_writeback(args, arg_start, Some(&h.path[0].name.name))?;
                         return Some(dest);
                     }
-                    self.insns.truncate(call_start);
+                    self.truncate_insns(call_start);
                     self.next_reg = call_next;
                     self.bail("Expr_Call_bare_method");
                     return None;
@@ -13264,9 +14413,8 @@ impl<'a> BytecodeCompiler<'a> {
                     && h.root.is_none()
                     && h.path.len() == 1
                     && h.path[0].selects.is_empty()
-                    && let Some(fd) = self
-                        .functions
-                        .and_then(|f| f.get(h.path[0].name.name.as_str()))
+                    && let Some(name) = self.scoped_callee_name(h.path[0].name.name.clone())
+                    && let Some(fd) = self.functions.and_then(|f| f.get(name.as_str()))
                     && fd.ports.len() == args.len()
                     && fd
                         .ports
@@ -13276,7 +14424,6 @@ impl<'a> BytecodeCompiler<'a> {
                         .iter()
                         .any(|a| matches!(a.kind, ExprKind::NamedArg { .. }))
                 {
-                    let name = h.path[0].name.name.clone();
                     let call_start = self.insns.len();
                     let call_next = self.next_reg;
                     let mut ok = true;
@@ -13313,7 +14460,7 @@ impl<'a> BytecodeCompiler<'a> {
                         ));
                         return Some(dest);
                     }
-                    self.insns.truncate(call_start);
+                    self.truncate_insns(call_start);
                     self.next_reg = call_next;
                 }
                 // class-perf Step 9h: a CLASS-SCOPE static call —
@@ -13376,6 +14523,17 @@ impl<'a> BytecodeCompiler<'a> {
                     && !self
                         .bare_member_names
                         .contains(h.path[0].name.name.as_str())
+                    // A free-function body has no `this` and no defining
+                    // class context, so a class-scope static call re-enters
+                    // the dispatcher with whatever frame ran last as the
+                    // caller's context. A CONCRETE class receiver is safe:
+                    // `CallStaticScoped` bakes the class name and
+                    // `exec_class_scope_static_call` resolves it through
+                    // `module.classes` without the stale `current_spec`. A
+                    // type parameter or typedef alias resolves against that
+                    // stale spec (the `uvm_report_server::get_server()`
+                    // string corruption), so for a free function the
+                    // simulator admits only elaborated class names here.
                     && self
                         .scope_static_receivers
                         .contains(h.path[0].name.name.as_str())
@@ -13421,7 +14579,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit_arg_slot_writeback(args, arg_start, Some(&member.name))?;
                         return Some(dest);
                     }
-                    self.insns.truncate(call_start);
+                    self.truncate_insns(call_start);
                     self.next_reg = call_next;
                     self.bail("Expr_Call_static_scope");
                     return None;
@@ -13438,7 +14596,7 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(r) = self.compile_pure_call(func, args, ctx_width) {
                     return Some(r);
                 }
-                self.insns.truncate(start);
+                self.truncate_insns(start);
                 self.next_reg = first_reg;
                 self.emit_expr_fallback(expr, ctx_width, "Expr_Call_impure")
             }
@@ -13807,7 +14965,7 @@ impl<'a> BytecodeCompiler<'a> {
             });
             return true;
         }
-        self.insns.truncate(start);
+        self.truncate_insns(start);
         self.next_reg = start_reg;
         self.bail_reason = saved_reason;
         false
@@ -15057,6 +16215,16 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                     if let Some(id) = self.lookup_signal_id(hier) {
+                        // §6.16: a character-indexed write into a STRING
+                        // signal (`s[2] = "r"`) is a string splice, not a bit
+                        // write, but `BlockingAssignBitDyn` below would
+                        // bit-bash the byte-vector container. Defer the whole
+                        // target to the AST interpreter, which routes it
+                        // through the string-char arm of `assign_value_index`.
+                        if self.signal_is_string_name(hier) {
+                            self.bail("blocking_target_string_char");
+                            return false;
+                        }
                         // Packed multi-D LHS: `mem_n[i] = data_i` for
                         // `logic [N-1:0][W-1:0] mem_n` must write a W-bit
                         // slice at `i*W +: W`, not a single bit. Emit a
@@ -16589,6 +17757,7 @@ impl<'a> BytecodeCompiler<'a> {
             has_fallback,
             nba_dup_targets,
             foreach_slots: self.foreach_slot_count,
+            static_locals: std::mem::take(&mut self.method_static_locals).into_boxed_slice(),
         }
     }
 
@@ -16640,6 +17809,7 @@ impl<'a> BytecodeCompiler<'a> {
         string_formals: &HashSet<String>,
         writeback_formals: &[String],
         result: Option<(&str, u32, bool, bool)>,
+        ret_is_collection: bool,
         body: &[&crate::ast::stmt::Statement],
     ) -> Option<(CompiledBlock, RegId, Option<RegId>, Option<RegId>)> {
         use crate::ast::stmt::StatementKind;
@@ -16650,6 +17820,10 @@ impl<'a> BytecodeCompiler<'a> {
         self.allow_ast_fallback = false;
         self.allow_expr_fallback = false;
         self.allow_waits = false;
+        self.method_ret_is_collection = ret_is_collection;
+        self.free_function_mode = method_class.starts_with("__free_fn__");
+
+        self.method_static_locals.clear();
         self.class_shadow_names = class_shadow_names.clone();
         self.member_safe_names = member_safe_names.clone();
         self.bare_member_names = bare_member_names.clone();
@@ -16778,6 +17952,7 @@ impl<'a> BytecodeCompiler<'a> {
                 self.method_result_width = if rw > 0 { Some(rw) } else { None };
                 self.method_result_is_class = is_class;
                 self.method_result_is_string = is_string;
+                self.method_ret_is_collection = ret_is_collection;
                 self.method_return_val_reg = Some(r);
                 (Some(r), Some(r))
             }
@@ -16813,7 +17988,7 @@ impl<'a> BytecodeCompiler<'a> {
                 );
             }
             // Roll back everything; leave the compiler in non-method mode.
-            self.insns.truncate(start_len);
+            self.truncate_insns(start_len);
             self.next_reg = start_reg;
             self.method_mode = false;
             self.method_this_reg = None;
@@ -16822,6 +17997,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_string_ret_names.clear();
             self.pkg_enum_consts.clear();
             self.functions = None;
+            self.dpi_import_fds = None;
             self.method_class = None;
             self.handle_member_types = None;
             self.class_method_names.clear();
@@ -16830,12 +18006,15 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_result_width = None;
             self.method_result_is_class = false;
             self.method_result_is_string = false;
+            self.method_ret_is_collection = false;
+            self.free_function_mode = false;
             self.string_formal_names.clear();
             self.string_member_names.clear();
             self.coll_member_names.clear();
             self.static_coll_member_names.clear();
             self.coll_elem_member_names.clear();
             self.cast_reg_ok_locals.clear();
+            self.method_static_locals.clear();
             self.method_ret_jumps.clear();
             self.bail_reset();
             return None;
@@ -16878,6 +18057,18 @@ impl<'a> BytecodeCompiler<'a> {
             if let Some(&(fr, _)) = self.local_var_regs.get(name) {
                 self.emit(Insn::Move(fr, fr));
             }
+        }
+        // §6.21: the same observable-export marker for STATIC locals — the
+        // dispatch shell reads their registers after `exec_insns` (to
+        // persist them into `static_local_vars` via the exit sync), so a
+        // body-final store must not be NOP'd by copy-forwarding either.
+        let static_local_slots: Vec<RegId> = self
+            .method_static_locals
+            .iter()
+            .map(|(_, s, _)| *s)
+            .collect();
+        for slot in static_local_slots {
+            self.emit(Insn::Move(slot, slot));
         }
 
         let block = self.finish();
@@ -16980,6 +18171,14 @@ impl<'a> BytecodeCompiler<'a> {
                     f(x as RegId);
                 }
             }
+            // class-perf collection-return: a contiguous arg range read.
+            Insn::RetCollection(a, n) => {
+                for x in *a as usize..*a as usize + *n as usize {
+                    f(x as RegId);
+                }
+            }
+            // class-perf collection-return store: reads the call's result.
+            Insn::AssignPendingColl(_, v) => f(*v),
             // Step 9g: a static-property READ has no register inputs.
             Insn::LoadClassStatic(..) => {}
             Insn::StoreClassStatic(_, src) => f(*src),
@@ -17644,6 +18843,14 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 let ip = Self::in_place_reg(ins);
                 if ip == Some(md) || ip == Some(ms) {
+                    break;
+                }
+                // A self-move `Move(r, r)` is an observable-export marker
+                // (method result, output formal, static local: the runtime
+                // reads `r` after the block). Rewriting its read would turn
+                // it into a real copy that this pass then drops as dead, and
+                // the export would be lost; it keeps `md` live instead.
+                if matches!(ins, Insn::Move(a, b) if a == b && *a == md) {
                     break;
                 }
                 if Self::insn_reads_reg(ins, md) && !Self::replace_read_reg(&mut insns[j], md, ms) {
@@ -18792,6 +19999,12 @@ impl<'a> BytecodeCompiler<'a> {
                 // Collection element store defines nothing (the storage key
                 // is a flat string in `signals`).
                 Insn::StoreCollElem(..) => {}
+                // Collection-return hand-off defines no SSA value (the
+                // result leaves via the side-channel snapshot store).
+                Insn::RetCollection(..) => {}
+                // The collection-return store writes a collection, not a
+                // register (no SSA value defined).
+                Insn::AssignPendingColl(..) => {}
                 // `$cast`: the 1/0 result's width is statically 32, but the
                 // register route also re-defines the dest slot at a runtime
                 // width (the frame arm's fit) — drop both from tracking.
@@ -19786,6 +20999,7 @@ mod tests {
             has_fallback: true,
             nba_dup_targets: false,
             foreach_slots: 0,
+            static_locals: Box::new([]),
         };
         let lower =
             |cb: &CompiledBlock| lower_two_state(cb, &[8], &[false], &[false], &HashMap::default());
@@ -19900,6 +21114,7 @@ mod tests {
             &HashSet::default(),
             &[],
             Some(("f", 32, false, false)),
+            false,
             &body,
         );
         let (block, this_reg, _result_reg, _ret_reg) =
@@ -19996,6 +21211,7 @@ mod tests {
             &HashSet::default(),
             &[],
             Some(("f", 32, false, false)),
+            false,
             &body,
         );
         let compiled =
@@ -20077,6 +21293,7 @@ mod tests {
                     &HashSet::default(),
                     &[],
                     Some(("f", 32, false, false)),
+                    false,
                     &body
                 )
                 .is_none(),
@@ -20596,6 +21813,16 @@ pub enum TsInsn {
     Jmp {
         t: u32,
     },
+    /// A backward `Jmp` (a loop back-edge; rewritten once the stream is
+    /// final): Ctrl-C bails the block to the four-state VM, whose back-edge
+    /// poll stops the run. A long loop inside one time slot never reaches the
+    /// event loop's own poll. A separate instruction rather than a test in
+    /// `Jmp`, so forward jumps pay nothing.
+    JmpPoll {
+        t: u32,
+    },
+    /// Ahead of a do-while back-edge (`BrNz`), same purpose as `JmpPoll`.
+    LoopPoll,
     /// Jump-table dispatch (§12.5 `case`). Two-state registers are X-free by
     /// the eval-site prefilter, so the 4-state arm's "any x/z bit matches no
     /// pattern -> default" branch cannot arise and this reduces to a bounds-
@@ -21289,6 +22516,8 @@ pub fn ts_read_masks(insns: &[TsInsn], widths: &[u32]) -> Option<(Vec<(u32, u64)
             | TsInsn::BrFalse { .. }
             | TsInsn::BrNz { .. }
             | TsInsn::Jmp { .. }
+            | TsInsn::JmpPoll { .. }
+            | TsInsn::LoopPoll
             | TsInsn::CaseJmp { .. }
             | TsInsn::CaseMaskJmp { .. }
             | TsInsn::RedOr { .. }
@@ -23370,6 +24599,10 @@ pub fn lower_two_state(
             }
             Insn::BranchUnlessZero(s, t) => {
                 narrow_reg!(rw, *s, "wide branch condition");
+                // do-while back-edge: see `TsInsn::LoopPoll`.
+                if (*t as usize) <= ins_i {
+                    out.push(TsInsn::LoopPoll);
+                }
                 out.push(TsInsn::BrNz {
                     s: *s as u16,
                     t: *t,
@@ -24528,6 +25761,15 @@ pub fn lower_two_state(
         // four-state index map exact instead.
         fuse_ts_pairs(&mut out);
     }
+    // Loop back-edges poll Ctrl-C (see `TsInsn::JmpPoll`). In place, so no
+    // index moves; nothing after this point re-reads branch targets.
+    for (i, insn) in out.iter_mut().enumerate() {
+        if let TsInsn::Jmp { t } = *insn {
+            if (t as usize) <= i {
+                *insn = TsInsn::JmpPoll { t };
+            }
+        }
+    }
     if track && std::env::var_os("XEZIM_TS_DUMP").is_some() {
         eprintln!("[TS-DUMP] {} insns:", out.len());
         for (i, ti) in out.iter().enumerate() {
@@ -24562,6 +25804,39 @@ pub fn lower_two_state(
         writes: writes.into_boxed_slice(),
         writes_span: writes_span.into_boxed_slice(),
     })
+}
+
+/// §20.5 / §20.8: the system functions whose result is REAL — the
+/// conversions to real, `$realtime`, and the real math functions.
+pub(crate) fn system_function_is_real(name: &str) -> bool {
+    matches!(
+        name,
+        "$itor"
+            | "$bitstoreal"
+            | "$bitstoshortreal"
+            | "$realtime"
+            | "$ln"
+            | "$log10"
+            | "$exp"
+            | "$sqrt"
+            | "$pow"
+            | "$floor"
+            | "$ceil"
+            | "$sin"
+            | "$cos"
+            | "$tan"
+            | "$asin"
+            | "$acos"
+            | "$atan"
+            | "$atan2"
+            | "$hypot"
+            | "$sinh"
+            | "$cosh"
+            | "$tanh"
+            | "$asinh"
+            | "$acosh"
+            | "$atanh"
+    )
 }
 
 /// IEEE 1800-2017 §20/§21 result type of a system FUNCTION as (width,

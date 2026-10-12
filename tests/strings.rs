@@ -25,6 +25,8 @@ mod display_only_always;
 mod dpi_child_module_import;
 #[path = "strings/dpi_export_task_waits.rs"]
 mod dpi_export_task_waits;
+#[path = "strings/dpi_export_types.rs"]
+mod dpi_export_types;
 #[path = "strings/dpi_integration_tests.rs"]
 mod dpi_integration_tests;
 #[path = "strings/dpi_library_loading.rs"]
@@ -77,6 +79,14 @@ mod ref_arg_assoc_writeback;
 mod ref_arg_collection_writeback;
 #[path = "strings/string_eq_relational_2state.rs"]
 mod string_eq_relational_2state;
+#[path = "strings/string_index_write_frame_local.rs"]
+mod string_index_write_frame_local;
+#[path = "strings/string_char_index_write_followups.rs"]
+mod string_char_index_write_followups;
+#[path = "strings/string_char_receiver_shapes.rs"]
+mod string_char_receiver_shapes;
+#[path = "strings/task_string_formal_scope.rs"]
+mod task_string_formal_scope;
 #[path = "strings/string_flag_not_clobbered_by_samed_name_local.rs"]
 mod string_flag_not_clobbered_by_samed_name_local;
 #[path = "strings/string_index_ref_queue.rs"]
@@ -97,6 +107,8 @@ mod struct_elem_string_member_format;
 mod system_task_gaps;
 #[path = "strings/uvm_dpi_driver_linkage.rs"]
 mod uvm_dpi_driver_linkage;
+#[path = "strings/uvm_dpi_user_library_wins.rs"]
+mod uvm_dpi_user_library_wins;
 #[path = "strings/vpi_callbacks.rs"]
 mod vpi_callbacks;
 #[path = "strings/vpi_mcd_and_time_queries.rs"]
@@ -111,3 +123,5 @@ mod vpi_routines;
 mod vpi_typed_port_kinds;
 #[path = "strings/wide_string2num.rs"]
 mod wide_string2num;
+#[path = "strings/dpi_typedef_return.rs"]
+mod dpi_typedef_return;

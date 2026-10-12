@@ -6,6 +6,341 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 # What's new in 0.11
 
+### Unreleased
+
+**Correctness**
+
+* In a method of a class with an `int s` property, `s = v` writes the
+  property even when another class has a struct property `s` and the module
+  has a struct variable `s`; the write used to land in the module struct.
+* A method called more than 1000 times reads `h.val` through a handle of
+  class `node` from `node`'s `val` when the object is a subclass that
+  redeclares `val`; it used to read the subclass's copy once compiled.
+* A character write `s[i] = c` changes one character of a string reached
+  as a task formal (`ref`, `inout`, `input`, `output`), a class property
+  (`this.s[i]`, `c.s[i]`, `c.b.s[i]`, `C::s[i]`), a struct member, an element
+  of a string array, queue or associative array (`sa[k][i]`, `s2[a][b][i]`),
+  or a module string written from an `always` block. A write to a whole
+  element of a string collection (`c.b.q[1] = "x"`, `s2[1][2] = "x"`) still
+  replaces that element, and a task's string formal no longer makes a
+  same-named packed variable elsewhere read as a string. (from PR #292 by
+  Thomas Burg)
+* A variable declared in a `begin…end` block of a task, function or method
+  goes out of scope when the block ends: an enclosing variable, class
+  property or module variable of the same name is visible again with its own
+  value. This holds for blocks that wait (`#1`, `fork…join`), for blocking
+  `repeat`/`for`/`while`/`foreach` bodies, for `static` block variables, and
+  for array and queue block variables. A method- or block-local unpacked
+  struct named like an `int` property is the local, and `s = f()` writes an
+  `int` property named like a module struct. A `static` variable of a package
+  or module task is one variable for every calling class. A fork child's
+  write to its parent's automatic wakes the parent's `wait` before the
+  time step's nonblocking assignments update, and a UVM register's second backdoor `write` no longer
+  dereferences a null `map_info`. (from PR #293 by Thomas Burg)
+* Unpacked-array locals of an automatic task, including multi-dimensional
+  ones, are per invocation, so concurrent calls no longer share them. Tasks
+  and functions in a `module automatic`, `interface automatic`, `program
+  automatic` or `package automatic` are automatic unless declared `static`.
+  An `output`, `inout` or `ref` array formal writes back when its actual is
+  a class property (`fill(prop)`, `this.prop`, `c.prop`, `o.i.prop`, a
+  `[2][2]` property), and when the callee declares a local with the actual's
+  name; an integer-keyed array stays integer-keyed. Hierarchical and
+  package-qualified actuals (`u.A`, `i.IA`, `pk::PA`) keep writing back. An
+  `output` array formal starts at its type's default instead of a copy of
+  the actual, and `foreach` over a local `int a[int]` binds negative keys.
+  (from PR #288 by Thomas Burg)
+* An `@(posedge clk iff g)` wait in a class task evaluates its guard in the
+  waiting process: the guard reads that object's fields and the task's
+  locals (`@(posedge vif.clk iff vif.gnt[master_id] === 1)`), so several
+  objects parked on one clock no longer see each other's state. Inside
+  `req.randomize() with {...}`, a receiver-qualified element constraint
+  (`req.data[0] == d`) and a receiver-qualified size (`req.data.size() == 3`)
+  apply to the randomized object; the size used to be ignored. A size that
+  conflicts with the class constraints makes `randomize()` return 0. In
+  `pre_randomize`, `post_randomize` and when the class has a property named
+  like the receiver, `req` keeps its ordinary meaning. (from PR #287 by
+  Thomas Burg)
+* `randomize()` with a soft constraint and an array sized by the constraints
+  no longer fails when a constraint reads a member path through `this`
+  (`this.lo`, `this.lim.lo`) that names state rather than a random variable.
+  (#256, from PR #257 by Taichi Ishitani)
+* A member read through a class handle (`item.item.len`) no longer picks up
+  an unrelated struct variable of the same name in another scope or another
+  process, and a class handle sent through a mailbox from a parameterized
+  class reaches the receiver while another specialization's struct receiver
+  is waiting. A `ref` or `const ref` class-handle formal keeps following the
+  caller's variable after the caller reassigns it. (#258, #260, from PR #259
+  by Taichi Ishitani)
+* A base class specialized with named parameter assignments inside an
+  `extends` argument (`extends wrap #(.BASE(base #(.REQ(REQ))))`) binds its
+  parameters by name; it used to bind them by position, which could end in a
+  null dereference.
+* A parameter declared with a type or range takes its value as an assignment
+  to that type, for its default, a `#(...)` override and a `defparam`: the
+  value is evaluated in the declared width, wrapped to it and given the
+  declared signedness. `parameter [3:0] P = -1` is 15, `signed [3:0]` turns 15
+  into -1, and `#(.P(4'hF + 4'h1))` on `[7:0]` is 16. Real values round
+  (`parameter int P = 2.6` is 3), 2-state types drop x and z, and
+  unpacked-array elements and pattern overrides wrap per element. A value
+  parameter typed by a type parameter keeps that type's full width, and a
+  range that uses another parameter of the same instance uses the instance's
+  own value. (#237, from xezim-core PR #52 and PR #264 by Ganesh T S)
+* A function or task with an early `return` inside a loop that cannot be
+  unrolled no longer crashes the bytecode compiler ("index out of bounds")
+  or leaves a caller's `break`/`continue` unpatched, which hung the
+  simulation; a `for` loop whose header falls back to the interpreter no
+  longer does either. (#268, from PR #267 by AaronKel)
+* A static call on a class specialization that nests another one or uses
+  named parameter assignments (`uvm_config_db#(cfg#(AW,DW))::get`,
+  `db#(cfg#(.AW(AW),.DW(DW)))`, `db#(.T(...))`) resolves the enclosing
+  class's parameters at every level, so the getter reaches the specialization
+  the setter wrote. (#269, from PR #270 by AaronKel)
+* `foreach` over an associative array keyed by class handles binds the loop
+  variable to the key's class, so property writes through it land; an
+  associative array returned through a class method's `output` formal is
+  copied back; and processes parked on NBA-region completion (as in
+  `uvm_wait_for_nba_region`) resume only after the time slot's queued
+  processes, their `#0` continuations and their nonblocking assignments have
+  run (IEEE 1800 §4.5). (#277, from PR #275 by Thomas Burg)
+* `Alias::type_id::create(...)` through a chain of class typedefs, including
+  package-qualified aliases and a parameterized specialization in the middle
+  of the chain, reaches the class's factory registry, so factory overrides
+  apply and the object is not null. (#274, from PR #276 by AaronKel)
+* An unrolled `for` loop over a signed variable runs the right number of
+  times when its bounds are negative (`for (int i = 1; i > -1; i--)`); it
+  used to run zero times. (#278)
+* A class member read or compared through a handle, through `this` or by its
+  bare name in a method (`t.irq != x`) is no longer mistaken for an interface
+  instance of the same name. (#271, reported by AaronKel)
+* A covergroup in a parameterized class builds its bins from that
+  specialization's parameters (`bins b[] = {[0:N-1]}`), so
+  `get_inst_coverage()` counts samples correctly. (#273, reported by AaronKel)
+* `pop_front()`/`pop_back()` on a queue of unpacked structs returns every
+  member, whether it goes to a local, a class property, a return value, an
+  argument or a declaration initializer, and the initializer form pops only
+  once. A scalar `bit` argument of a class method has the formal's one-bit
+  width. (#272, reported by AaronKel)
+* `randomize()` with a soft constraint and an array sized by the
+  constraints no longer returns 0 when the joint solver gives up: once its
+  runs are used up, an assignment that satisfies every constraint is
+  accepted. (#256, reported by Taichi Ishitani)
+* The constraint solver handles more shapes: packed-struct fields set from
+  other random variables, bit and part selects of random array elements,
+  elements or bits at positions chosen by random variables, equalities whose
+  sides wrap at their width, `$countones`, and `foreach` over a state vector.
+  (#255, reported by rharikrishna25)
+* Assertion control (§20.11, §20.12) is implemented: `$asserton`,
+  `$assertoff`, `$assertkill`, `$assertpasson`/`$assertpassoff`,
+  `$assertfailon`/`$assertfailoff`, `$assertnonvacuouson`/`$assertvacuousoff`
+  and `$assertcontrol` (Lock/Unlock, assertion-type and directive-type masks,
+  `levels` and a list of scopes or assertion names). They apply to
+  concurrent, immediate and deferred assertions and to covers; they used to
+  print "assertion control is not modeled" and be ignored, so assertions kept
+  firing after `$assertoff`.
+* `size()` on queues and dynamic arrays, `num()`/`size()` on associative
+  arrays, `len()` on strings, `num()` on enums and mailboxes, and the array
+  query functions (`$size`, `$bits`, `$unpacked_dimensions`, ...) return a
+  signed `int`, so `q.size() - 2` on an empty queue is -2 and a loop such as
+  `for (i = 0; i < q.size() - 1; i++)` no longer runs about 4 billion times.
+  `$size` of an associative array is its number of entries, and `$bits` of a
+  queue is its current size in bits. (#280)
+* A `wait (...)` inside a DPI-exported task called from C blocks until its
+  condition holds even when a timed event (a clock) is pending; it used to
+  hang until the run ended. This covers event `.triggered`, nets and the
+  task's own automatic variables, other processes' `wait`s keep resuming
+  meanwhile, and a wait that can never be satisfied ends the run with the
+  task still waiting. (#279, reported by Dragon-Git)
+* `randomize()` solves classes with rand variables wider than 64 bits: a wide
+  member that no constraint reads no longer blocks the rest of the class, and
+  shifts by a constant, masks, part and bit selects, struct fields,
+  `==`/`!=`, `inside` and comparisons on wide scalars, wide array elements
+  and wide packed structs are solved over 64-bit segments. Arithmetic on a
+  wide variable is still left to the trial loop. (#261, reported by Taichi
+  Ishitani)
+* `randomize()` solves `$countones` constraints whose other side is not
+  linear, such as `$countones(strb[i]) == 2**size` in AXI write transactions,
+  with counts following the uniform distribution over solutions (§18.5.10).
+* `randomize()` no longer reports success with a violated `foreach`
+  constraint over a state vector, queue, dynamic array or packed array, or
+  one nested in another `foreach` (§18.6.1).
+* Copying an unpacked struct with a wide multi-dimensional packed member is
+  done 64 bits at a time instead of bit by bit.
+* `$bits` and the array query functions (`$size`, `$dimensions`,
+  `$unpacked_dimensions`, `$left`, `$right`, `$low`, `$high`, `$increment`)
+  of a fixed-size unpacked-array variable fold to its declared shape wherever
+  a constant is needed: localparams, parameter values, packed widths and
+  generate conditions. `localparam P = $bits(fx)` on `int fx[4]` was 0 and
+  is now 128.
+* A `generate if`/`case` condition or a generate `for` bound may use these
+  queries; `if ($size(fx) - 5 < 0)` used to be rejected as not constant. A
+  generate `for` genvar that starts from a parameter, a negative number or an
+  expression no longer starts at 0.
+* An integral operand of a real operator is converted from its own value and
+  width: with `int unsigned u = 1`, `(u - 2) * 1.0` and `r = u - 2` give
+  4294967295.0, not 18446744073709551616.0 (§11.8.2).
+* A `let` may be declared in a function, task, class method, `begin`/`fork`
+  block, generate block, checker, program or clocking block (§11.13).
+  Instances follow the standard's substitution rules, including defaults,
+  typed formals and the width of the surrounding expression, and
+  `import pkg::name` and `pkg::name` reach package lets. (#283, reported by
+  Dragon-Git)
+* Subroutine prototypes (`extern`, `pure virtual`, interface class, DPI)
+  accept a typedef return type with packed dimensions, such as
+  `extern function M [1:0] f();`. DPI imports may return a typedef of an
+  integer, real or other small C type. (#284, reported by Dragon-Git)
+* `--dpi-lib` works on non-x86 hosts: the DPI export trampoline is built with
+  `$CC` (default `cc`) and no x86-only flags, and a trampoline build failure
+  is named in the library-load error. (#282, reported by Dragon-Git)
+* A variable whose type is a typedef of a virtual interface
+  (`typedef virtual bus_if vif_t; vif_t v;`) starts as `null` at module,
+  `$unit`, subroutine and block scope and in arrays, and `$typename` names
+  virtual interfaces as declared (`virtual bus_if.mp`,
+  `virtual pbus_if #(16)`) instead of `logic`. (#285, reported by Dragon-Git)
+* `$readmemh`, `$readmemb`, `$writememh` and `$writememb` reach another
+  instance's memory through a hierarchical name from tasks, functions and
+  class methods, and through instance-array elements (`ra[1].mem`). A target
+  that names no memory is reported as an error, and a file that cannot be
+  opened as a warning, instead of being skipped silently. (#281, reported by
+  jjts)
+* A class that extends a parameterized class resolves the base's type
+  parameters, including defaulted ones such as `RSP = REQ`, in its own
+  methods: `RSP::type_id::create()` in a `uvm_driver #(item)` subclass no
+  longer returns null (§8.25).
+* A class property typed by a type parameter, such as a sequence's `req`, is
+  no longer mistaken for a same-named struct variable elsewhere, so each
+  `req = ...::type_id::create()` takes effect.
+* `$size`, `$left`, `$dimensions` and the other array queries report
+  per-dimension bounds for multi-dimensional packed class properties and for
+  members of struct formals (§20.7).
+* A dynamic-array class property initialized with `new[n]` is sized when the
+  object is constructed (§8.7).
+* `find*`, `min`, `max` and `unique` locator methods work on associative
+  arrays with integral keys, in key order (§7.12).
+* With these, the axi4 AVIP's write, read and write-read tests run to
+  completion.
+* Writing one character of a string that lives in a function or task frame
+  (`s[i] = "x"` on a local, a static local, a `ref`/`inout`/`output`
+  function formal or an automatic local in a forked child) replaces that
+  byte instead of setting a bit. (from PR #289 by Thomas Burg)
+* A class function that runs as bytecode (after 1000 calls) writes back every
+  `output` argument, not only the last, and at the declared width of a packed
+  typedef (`output M [1:0] o`). Its `static` variables keep counting across
+  that switch, and a non-virtual method it calls through a base-class handle
+  runs the base class's method (§8.20). A module or package function with a
+  `static` variable is no longer inlined into module code, which restarted
+  the variable on every call. A user class method named `put` called inside a
+  function now runs. A task that reaches a wait only through a call cycle
+  (`a` calls `b`, `b` calls `a`, and `a` waits) suspends its caller again.
+  (from PR #265 by Thomas Burg, with follow-ups)
+
+**Performance**
+
+* More class methods and package functions run as bytecode: those that read
+  a member off an element of a class-handle collection (`m[k].val`,
+  `q[i].name`), package functions that call a static method of a class
+  (`Srv::get()`), and bodies that store a returned queue or dynamic array in
+  a local (`q = f(..)`). Element member reads run 62% fewer instructions
+  and a package function calling a singleton getter 15% fewer. (from PR
+  #294 by Thomas Burg, with follow-ups)
+* Wait-free class tasks and package and module functions run as bytecode once
+  they cross the same call threshold as class functions (`XEZIM_METHOD_TIER`,
+  default 1000 calls), and compiled code calls compiled package functions
+  directly. A class-heavy benchmark (400,000 calls of a wait-free task that
+  makes a virtual call and two package-function calls) runs 16% fewer
+  instructions; the axi4 AVIP runs 0.4% more. (from PR #265 by Thomas Burg)
+* Imported DPI tasks run on their own stack on x86_64 and aarch64, for Linux
+  (glibc and musl) and macOS, so a `wait` in an exported task behaves the
+  same everywhere. `XEZIM_DPI_FIBERS=0` selects the nested-scheduler
+  fallback, which no longer loses concurrent callers or ignores a `$finish`.
+  (#290, reported by Dragon-Git)
+* Exported subroutines accept every formal type DPI can carry (§35.5.6,
+  Annex H): `chandle` as `void*`, a `string` result or output, packed vectors
+  wider than 64 bits through `svLogicVecVal*`/`svBitVecVal*`, the exact
+  scalar C types, and unpacked structs and arrays by pointer. A formal DPI
+  cannot carry is reported as an error at each call instead of silently
+  returning 0, and a wide or aggregate result is rejected (§35.5.5). (#291,
+  reported by Dragon-Git)
+* `randomize()` solves rand sub-objects held in fixed, dynamic and queue
+  arrays of handles, rand sub-object members wider than 64 bits (packed
+  structs, nested fields, packed-array elements) and `solve ... before` on
+  sub-object members together with the enclosing object (§18.5.9). Reading a
+  nested packed-struct field or packed-array element through a class handle
+  no longer returns 0. (#255, reported by rharikrishna25)
+* `randomize()` solves `sum()` constraints over elements of 16 bits or more,
+  where the sum wraps at the element width as §7.12.3 requires. A reduction
+  with a `with` clause has the clause expression's width and signedness, and
+  `size() inside {…}` picks a size in the set. (#295, reported by Ganesh-TNL)
+* Packed-struct arrays local to a task or function keep their field layout,
+  so `a[i].f` reads and writes work and `foreach` field constraints solve.
+  (#296, reported by Ganesh-TNL)
+* `std::randomize()` solves dynamic arrays and queues local to automatic
+  tasks jointly with the other variables, and `bit` array elements are
+  solved unsigned. (#297, reported by Ganesh-TNL)
+* `randomize()` and `std::randomize()` solve the size of a dynamic array
+  before its elements when a constraint ties the size to other variables
+  (`beats.size() == cmd.count + 1`, `a.size() + b.size() == t`) (§18.5.8.1);
+  they used to draw a size and retry until the time budget ran out.
+  Packed-struct elements whose type is a class type parameter are solved,
+  `(a >> k) == (b >> k)` and alignment masks on struct fields no longer stall
+  the solver, and a variable that caps another through a guarded `dist` is
+  drawn by the solutions it leaves. (#298, reported by Ganesh-TNL)
+* `std::randomize()` over several dynamic arrays with `foreach` constraints
+  succeeds, also when a size comes from another target (`p.size() == n`),
+  which used to allocate an array as large as a random `n` and hang. (#299,
+  reported by Ganesh-TNL)
+* `a.size() == n + m` compares at 32 bits, since `size()` and `num()` return
+  an `int`; narrower operands used to wrap. A field write to an element of a
+  class array of packed structs (`beats[i].last = 1`) is no longer dropped.
+
+**Usability**
+
+* `XEZIM_INIT_REG=random` now varies with the run's seed (`+seed=<n>`,
+  `-sv_seed <n>`), so a reset bug that depends on the power-up value can be
+  found by changing the seed; the same seed reproduces the same values, and
+  no seed (or seed 1) gives the pattern earlier releases used.
+
+* `-fst_scope_file <file>` reads FST dump scopes from a file (one or more per
+  line, `#`/`//` comments), and `-xezim_env <file>` sets `XEZIM_*` variables
+  from a file (`NAME=value`, `export`, `setenv`, `unsetenv` lines) before xezim
+  reads any of them, so a run's settings can live next to its file list
+  whatever shell starts it.
+
+* `-uvm` (or `--uvm`) adds the UVM library that `XEZIM_UVM_DIR` names, for
+  compile and simulation alike: its `src` directory joins the include path and
+  its `uvm_pkg.sv` the file list, so a UVM testbench needs only its own files.
+  `XEZIM_UVM_DIR` may name the `src` directory, a release root, or a checkout
+  of several releases, where `XEZIM_UVM_VERSION` picks one (default: the
+  newest). Without `-uvm` nothing is added.
+
+* `-override_timescale <unit>/<precision>` (also `--override-timescale`)
+  gives every design element, package and compilation unit one timescale,
+  replacing every `` `timescale `` directive, `timeunit`/`timeprecision`
+  declaration and `--module-timescale`: with `1ns/1ns` a bare `#10` is 10 ns
+  everywhere, with `1ps/1ps` 10 ps. Literals with a unit (`#3ns`) keep their
+  absolute value. It works on the command line and in `-f`/`-F` files.
+
+**Waveforms**
+
+* An FST scope can carry a depth, `LEVEL:SCOPE`, both in `--fst-scope` and in
+  a `-fst_scope_file`: `1:top.u_cpu` dumps only that scope's own signals,
+  `2:top.u_cpu` one level of children too, and no prefix (or `0:`) every
+  level, as `$dumpvars` does (§21.7.1.4).
+
+* Ctrl-C and SIGTERM also stop a long loop inside one time slot, and close
+  the waveform dumps normally. When the run cannot stop (a DPI call that does
+  not return), the FST dump is closed at the current time before the process
+  ends. FST dumps reach the disk at least every 2 seconds
+  (`XEZIM_FST_FLUSH_SECS`), so a run killed with `kill -9` or by running out
+  of memory leaves a readable file up to its last write.
+
+* An FST dump killed while a value-change block was being written (`kill -9`,
+  an out-of-memory kill, a second Ctrl-C) is readable again. The block went
+  to the file in 8 KB pieces with its length patched last, so a kill in that
+  window left a block that made every reader reject the whole file (about 1
+  kill in 15 under load). Each block now reaches the file whole or not at
+  all, and the first block is written as soon as the run starts, so the file
+  always opens and holds everything up to the last block written.
+
 ### 0.11.1 — complete VPI, faster memory models, IEEE 1800 conformance fixes (October 2026)
 
 **Correctness**

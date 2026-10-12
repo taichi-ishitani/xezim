@@ -95,6 +95,9 @@ pub(super) struct UvmDpiState {
     argv_idx: usize,
     /// `uvm_re_match` patterns compiled so far, failures included.
     re_cache: HashMap<String, Result<PosixRe, (i32, String)>>,
+    /// Live handles for `uvm_re_compexecfree`'s (pattern, deglob) cache —
+    /// those chandles never escape to SV, so they can persist.
+    re_exec_handles: HashMap<(String, bool), u64>,
     /// Compiled patterns behind the chandles `uvm_dpi_regcomp` and
     /// `uvm_re_comp` returned.
     handles: HashMap<u64, PosixRe>,
@@ -317,6 +320,36 @@ impl Simulator {
                 let re = self.uvm_dpi_str(args, 0);
                 let s = self.uvm_dpi_str(args, 1);
                 let deglobbed = self.uvm_dpi_int(args, 2) != 0;
+                if c_name == "uvm_re_compexecfree" {
+                    // The compiled chandle never escapes to SV (the SV
+                    // wrapper frees it immediately), so a per-(pattern,
+                    // deglob) regex cache is unobservable from SV: identical
+                    // match results without a regcomp per call.
+                    let key = (re.clone(), deglobbed);
+                    let (h, keep) = match self.uvm_dpi.re_exec_handles.get(&key) {
+                        Some(&h) => (h, true),
+                        None => {
+                            let h = self.uvm_re_comp(&re, deglobbed);
+                            let keep = h != 0 && self.uvm_dpi.re_exec_handles.len() < RE_CACHE_MAX;
+                            if keep {
+                                self.uvm_dpi.re_exec_handles.insert(key, h);
+                            }
+                            (h, keep)
+                        }
+                    };
+                    let r = if h == 0 {
+                        libc::REG_NOMATCH
+                    } else {
+                        self.uvm_dpi_handle_exec(c_name, h, &s)
+                    };
+                    if let Some(out) = args.get(3) {
+                        self.assign_value(out, &int_val(r));
+                    }
+                    if !keep {
+                        self.uvm_dpi.handles.remove(&h);
+                    }
+                    return Some(Value::from_u64((h != 0) as u64, 1));
+                }
                 let h = self.uvm_re_comp(&re, deglobbed);
                 // A pattern that fails to compile reports REG_NOMATCH.
                 let r = if h == 0 {
@@ -327,12 +360,7 @@ impl Simulator {
                 if let Some(out) = args.get(3) {
                     self.assign_value(out, &int_val(r));
                 }
-                if c_name == "uvm_re_compexec" {
-                    chandle_val(h)
-                } else {
-                    self.uvm_dpi.handles.remove(&h);
-                    Value::from_u64((h != 0) as u64, 1)
-                }
+                chandle_val(h)
             }
             "uvm_dpi_get_next_arg_c" => Value::from_string(&self.uvm_dpi_next_arg(args)),
             "uvm_dpi_get_tool_name_c" => Value::from_string("xezim"),

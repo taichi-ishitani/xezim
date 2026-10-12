@@ -55,6 +55,8 @@ mod case_default_arm;
 mod chained_member_access;
 #[path = "misc/child_decl_init_and_wide_rand.rs"]
 mod child_decl_init_and_wide_rand;
+#[path = "misc/cli_files.rs"]
+mod cli_files;
 #[path = "misc/clocked_loop_case_nest_compiled.rs"]
 mod clocked_loop_case_nest_compiled;
 #[path = "misc/code_coverage.rs"]
@@ -133,6 +135,8 @@ mod ifu_precode_c910_pc710;
 mod implicit_static_diagnostic;
 #[path = "misc/include_path_from_function_macro.rs"]
 mod include_path_from_function_macro;
+#[path = "misc/init_reg_seed.rs"]
+mod init_reg_seed;
 #[path = "misc/inspect_types.rs"]
 mod inspect_types;
 #[path = "misc/interconnect_and_var_ports.rs"]
@@ -203,6 +207,8 @@ mod nonzero_lsb_indexed_part_select;
 mod obj_assocd_event_disable_fork;
 #[path = "misc/operators_11_select_reduce.rs"]
 mod operators_11_select_reduce;
+#[path = "misc/override_timescale.rs"]
+mod override_timescale;
 #[path = "misc/package_exports.rs"]
 mod package_exports;
 #[path = "misc/package_qualified_access_in_subroutine.rs"]
@@ -235,6 +241,8 @@ mod part_select_negative_bound_compiled;
 mod placeholder_parameter_replication;
 #[path = "misc/port_width_mismatch_explains.rs"]
 mod port_width_mismatch_explains;
+#[path = "misc/readmem_hierarchical_target.rs"]
+mod readmem_hierarchical_target;
 #[path = "misc/real_call_bytecode.rs"]
 mod real_call_bytecode;
 #[path = "misc/reduce_loop_unroll.rs"]
@@ -271,6 +279,8 @@ mod unnamed_block_end_label;
 mod unsized_decimal_wrap_warning;
 #[path = "misc/uvm_agent_active_config.rs"]
 mod uvm_agent_active_config;
+#[path = "misc/uvm_dir_env.rs"]
+mod uvm_dir_env;
 #[path = "misc/uvm_dpi_builtins.rs"]
 mod uvm_dpi_builtins;
 #[path = "misc/value_trace.rs"]
@@ -485,3 +495,5 @@ mod virtual_array_names;
 mod while_continue_final_iter;
 #[path = "misc/zero_width_select_unselected_generate.rs"]
 mod zero_width_select_unselected_generate;
+#[path = "misc/let_declaration_scopes.rs"]
+mod let_declaration_scopes;

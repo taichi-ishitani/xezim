@@ -15,6 +15,7 @@ how to use them together, see the [user guide](user-guide.md).
 |---|---|
 | `-D<MACRO>[=val]` | Define a preprocessor macro |
 | `-I<dir>` | Add an include directory |
+| `-uvm`, `--uvm` | Add the UVM library that `XEZIM_UVM_DIR` names: its `src` directory goes on the include path and its `uvm_pkg.sv` becomes the first source file, unless the file list already has a `uvm_pkg.sv`. Works in every mode and inside `-f`/`-F` files. Without `-uvm` nothing is added. See the [UVM guide](uvm-guide.md#adding-the-uvm-library-with--uvm) |
 | `--simulate` | Run the simulation (vs `--parse` / `--compile` / `--preprocess`) |
 | `-s <module>` | Select a top-level module. Repeat for multiple roots (e.g. `-s hdl_top -s hvl_top`); each is a root of its own in `%m`, messages, `$root` paths and waveform scopes, as when several tops are found automatically. A bare module name that is not a file does the same (see [below](#command-lines-from-other-simulators)) |
 | `--no-strict-top` | When an `-s` names no module, warn and find the tops automatically instead of exiting 1 |
@@ -45,7 +46,9 @@ how to use them together, see the [user guide](user-guide.md).
 | `+delay_mode_zero` / `+delay_mode_unit`, `+mindelays` / `+typdelays` / `+maxdelays` | Gate-level delay modes and min/typ/max selection |
 | `--wave` | Compile the model with waveform support, enabling `$dumpfile`/`$dumpvars` (off by default; `--fst`/`--xtrace` imply it) |
 | `--fst <file>` | Emit an FST (GTKWave binary) waveform dump |
-| `--fst-scope <hier>` | Restrict the FST dump to signals under `<hier>` (repeatable) |
+| `--fst-scope <hier>` | Restrict the FST dump to signals under `<hier>` (repeatable). `LEVEL:<hier>` limits the depth: `1:top.u1` dumps only `top.u1`'s own signals, `2:top.u1` one level of children too, and `0:` or no prefix every level (§21.7.1.4) |
+| `-fst_scope_file <file>` (also `--fst-scope-file`, `=` form) | FST scopes from a file, each optionally `LEVEL:SCOPE`: one or more per line, separated by spaces or commas, with `#` or `//` comments. Each adds a `--fst-scope`. Works in `-f`/`-F` files, where a relative path resolves as given, else next to the args file |
+| `-xezim_env <file>` (also `--xezim-env`, `=` form) | Set `XEZIM_*` variables from a file before xezim reads any of them: `NAME=value`, `export NAME=value`, `setenv NAME value`, `NAME value`, `unsetenv NAME`; `#`/`//` comments, quoted values. Values override the shell; several files apply in order. Command line only (an args file is read too late) |
 | `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
 | `--relax-implicit-static` | Accept `int x = ...;` inside a static task/function (§6.21) with a warning instead of an error — for third-party sources you cannot edit |
@@ -64,6 +67,12 @@ unless noted.
 |---|---|
 | `XEZIM_EVENT_EDGE=0` | On by default: clocked flop fires whose data inputs have not changed are skipped (1.13–1.30× wall on the C910/C906 benchmarks). `0` turns it off |
 | `XEZIM_PACKED_MEM=0` | On by default: large integral memories (elements up to 64 bits, arrays of more than 100,000 cells) live in a packed arena. `0` turns it off |
+| `XEZIM_COMPILE_METHODS=1` | On by default (see `XEZIM_METHOD_TIER`): compile class methods, wait-free class tasks and package or module functions to bytecode and execute them. `0` forces the AST interpreter |
+| `XEZIM_METHOD_TIER=N` | Compile a class method (function or wait-free task) or a package/module function only after N calls (default 1000; `0` compiles on the first call). A subroutine that never crosses the threshold stays on the interpreter with no compilation overhead |
+| `XEZIM_FAST_CALLS=1` | On by default: direct VM-to-VM dispatch of compiled methods without re-entering the interpreter's formal binding loop. `0` disables it |
+| `XEZIM_METHOD_CACHE=<dir>` | Persistent compiled-method cache directory across runs. `1` uses `~/.cache/xezim/method-cache`; unset (default) disables it. Corrupt entries transparently trigger recompilation |
+| `XEZIM_METHOD_PROFILE=1` | In-process sampling profiler for class methods. When `1`, prints AST-vs-bytecode execution-time histograms on simulation completion (default off) |
+| `XEZIM_FALLBACK_SITES=1` | Log each construct handed to the AST interpreter: the reason, source byte span and scope of the compile-fail / plan-decline site (default off) |
 | `XEZIM_JIT=1` | Compile bytecode blocks to machine code in-process (needs a `--features jit` build) |
 | `XEZIM_AOT=1` | Compile eligible blocks to native code via generated Rust + `rustc` instead of cranelift. **Requires `XEZIM_JIT=1` as well** — on its own it is a no-op. Needs `--features jit`. See the [user guide](user-guide.md#native-compilation) |
 | `XEZIM_AOT_OPT=0..3` | `rustc` optimization level for the generated crate (default 2) |
@@ -71,7 +80,9 @@ unless noted.
 | `XEZIM_NO_NATIVE_CACHE=1` | Disable the persistent native-library cache (`~/.cache/xezim/native`) |
 | `XEZIM_REGIONS=1` | Fuse dependency-connected compiled combinational entries into region blocks (experimental; currently net-negative on the benchmark set) |
 | `XEZIM_STUCK_CLOCK=1` | Flag a process parked on a clock/reset that never changes while the design keeps churning edges (`abort` variant for CI) |
+| `XEZIM_INIT_REG=0\|random` | Give registers (the flops of compiled clocked blocks) a defined value at time 0 instead of x: `0`, or `random`, a per-register pattern that changes with the run's seed (`+seed=<n>`, `-sv_seed <n>`; no seed and seed 1 give the same pattern), for reset-bug hunting |
 | `XEZIM_INIT_ZERO=1` | Coerce X-initialized signals/arrays to 0 (required for some C910/C906 workloads, e.g. CoreMark) |
+| `XEZIM_FST_FLUSH_SECS=N` | `--fst`: write the in-memory value-change block to the file at least every N wall seconds (default 2; fractions allowed; `0` flushes only when the block reaches 64 MB). The first block is written as soon as the run starts. A run that is killed at any moment (`kill -9`, out of memory, a second Ctrl-C) keeps everything up to the last flush, and the file stays readable: each block reaches the file whole or not at all |
 | `XEZIM_PROGRESS=N` | Emit a `[PROGRESS]` line every N wall-seconds (sim_time, iters, edges_fired, nba_q) |
 | `XEZIM_CACHE_DIR=<dir>` | Override the elaborated-design cache directory |
 | `XEZIM_NO_CACHE=1` | Disable the automatic elaborated-design cache |
@@ -83,6 +94,8 @@ unless noted.
 | `XEZIM_COV_DB=<path>` | Write the coverage results somewhere other than `xezim_cov.json` |
 | `XEZIM_MAX_INST_DEPTH=N` | Instantiation-depth cap (default 200) — turns unbounded recursive instantiation into a clean error instead of memory exhaustion |
 | `XEZIM_STACK_MB=N` | Stack size of the simulation worker thread (default 1024; `0` runs on the main thread) |
+| `XEZIM_UVM_DIR=<dir>` | The UVM library `-uvm` adds: a `src` directory, a release root holding `src/`, or a checkout holding several releases (`1.1d`, `1.2`, `1800.2-2017`, `1800.2-2020`) |
+| `XEZIM_UVM_VERSION=<release>` | With a multi-release `XEZIM_UVM_DIR`, the release subdirectory to use (default: the newest present) |
 | `XEZIM_VALUE_TRACE=<substr>[,...]` | Print every committed change of signals whose hierarchical name contains a pattern: time, name, old→new value, dispatch phase, writing process origin (file:line). NBA commits are labeled `nba` |
 | `XEZIM_VALUE_TRACE_LIMIT=N` | Cap value-trace output lines (default 20000) |
 
@@ -111,6 +124,7 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 | `-sv_seed <n>`, `-sv_seed random` | Same as `+seed=<n>` / `+seed=random` |
 | `-sv_lib <name>`, `-sv_root <dir>` | Load `<dir>/<name>.so` as a DPI library (`--dpi-lib`) |
 | `-timescale <u>/<p>` | Default timescale for design elements without one (`--module-timescale`) |
+| `-override_timescale <u>/<p>` (also `--override-timescale`, `=` form) | One timescale for every design element, package and compilation unit: every `` `timescale `` directive, `timeunit`/`timeprecision` declaration and `--module-timescale` is ignored. Bare delays count in `<u>`; literals with a unit (`#3ns`) keep their absolute value |
 | `-l <file>`, `-logfile <file>` | xezim's `-l`: all output goes to the file, none to the terminal |
 | `-c` | xezim's args-file flag when a file (or a path) follows; otherwise the batch-mode switch, accepted |
 | `-v <file>`, `-y <dir>`, `+libext+` | Library file / directory |

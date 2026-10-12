@@ -19,6 +19,8 @@ mod array_element_declared_signedness;
 mod array_parameter;
 #[path = "types/array_query_multidim_packed.rs"]
 mod array_query_multidim_packed;
+#[path = "types/array_query_of_declared_variable.rs"]
+mod array_query_of_declared_variable;
 #[path = "types/array_read_unknown_index_is_x.rs"]
 mod array_read_unknown_index_is_x;
 #[path = "types/ascending_indexed_part_select.rs"]
@@ -117,6 +119,8 @@ mod forward_typedef_class_handle_width;
 mod function_return_width;
 #[path = "types/generate_scope_struct_metadata.rs"]
 mod generate_scope_struct_metadata;
+#[path = "types/generate_with_array_queries.rs"]
+mod generate_with_array_queries;
 #[path = "types/header_parameter_declared_signedness.rs"]
 mod header_parameter_declared_signedness;
 #[path = "types/hierarchy_and_type_overrides.rs"]
@@ -195,6 +199,8 @@ mod packed_struct_member_width;
 mod param_cb_isolation;
 #[path = "types/param_registry_typeid_identity.rs"]
 mod param_registry_typeid_identity;
+#[path = "types/param_range_signedness.rs"]
+mod param_range_signedness;
 #[path = "types/param_signedness_and_generate_scope.rs"]
 mod param_signedness_and_generate_scope;
 #[path = "types/param_sized_array.rs"]
@@ -213,6 +219,8 @@ mod preprocessor_include_fatal;
 mod property_value_param_binding;
 #[path = "types/range_select_param_arith.rs"]
 mod range_select_param_arith;
+#[path = "types/real_conversion_of_integral_operands.rs"]
+mod real_conversion_of_integral_operands;
 #[path = "types/real_literal_comb_eval.rs"]
 mod real_literal_comb_eval;
 #[path = "types/real_valued_delay.rs"]
@@ -444,3 +452,5 @@ mod vector_type_arg_spec;
 mod zero_mask_call_elision;
 #[path = "types/zero_width_select_confidence.rs"]
 mod zero_width_select_confidence;
+#[path = "types/array_query_packed_decl_type.rs"]
+mod array_query_packed_decl_type;

@@ -101,6 +101,21 @@ fn fork_child_blocking_live_share() {
 }
 
 #[test]
+fn fork_child_merge_wake() {
+    // A fork...join_none child's write to the parent's task-local automatic
+    // reaches the suspended parent through the child->parent frame merge, and
+    // must wake the parked level-sensitive `wait` (§9.4.2) — inside a clock
+    // edge's cascade, before that edge's NBA region (reference: seen=0,1).
+    let msgs = outputs(include_str!("../fork_child_merge_wake.sv"), 100_000);
+    assert!(
+        msgs.iter().any(|m| m.contains("PASS result=1 seen=0,1")),
+        "{:?}",
+        msgs
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:?}", msgs);
+}
+
+#[test]
 fn orphan_force_release_compliance_ratchet() {
     let msgs = outputs(include_str!("../dpi/force_release_compliance.sv"), 100_000);
     let fails = msgs.iter().filter(|m| m.starts_with("FAIL")).count();
@@ -242,10 +257,6 @@ fn rand_width_overflow_and_dist_mwe() {
 #[test]
 fn issue_262_fscanf_percent_c() {
     let msgs = outputs(include_str!("../issue_cases/fscanf_262.sv"), 100_000);
-    assert!(
-        !msgs.iter().any(|m| m.starts_with("FAIL")),
-        "{:#?}",
-        msgs
-    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
 }

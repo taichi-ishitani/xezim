@@ -63,6 +63,14 @@ mod lrm_clause7_arrays;
 mod mailbox_array_new;
 #[path = "collections/mailbox_bounded.rs"]
 mod mailbox_bounded;
+#[path = "collections/mailbox_handle_named_like_struct.rs"]
+mod mailbox_handle_named_like_struct;
+#[path = "collections/member_off_handle_collection_elem.rs"]
+mod member_off_handle_collection_elem;
+#[path = "classes/compiled_method_test_env.rs"]
+mod compiled_method_test_env;
+#[path = "collections/call_ret_store_into_local_coll.rs"]
+mod call_ret_store_into_local_coll;
 #[path = "collections/multidim_assoc_array.rs"]
 mod multidim_assoc_array;
 #[path = "collections/noparen_array_methods.rs"]
@@ -103,8 +111,18 @@ mod queue_dyn_write_semantics;
 mod assoc_of_struct;
 #[path = "collections/builtin_class_construction_forms.rs"]
 mod builtin_class_construction_forms;
+#[path = "collections/callee_local_shadow_assoc_output.rs"]
+mod callee_local_shadow_assoc_output;
+#[path = "collections/array_actual_hier_pkg_writeback.rs"]
+mod array_actual_hier_pkg_writeback;
+#[path = "collections/callee_local_shadow_int_assoc.rs"]
+mod callee_local_shadow_int_assoc;
+#[path = "collections/output_array_formal_starts_default.rs"]
+mod output_array_formal_starts_default;
 #[path = "collections/class_member_semaphore_keys.rs"]
 mod class_member_semaphore_keys;
+#[path = "collections/count_methods_return_signed_int.rs"]
+mod count_methods_return_signed_int;
 #[path = "collections/foreach_live_size_bounds.rs"]
 mod foreach_live_size_bounds;
 #[path = "collections/foreach_packed_multidim.rs"]
@@ -117,3 +135,7 @@ mod mailbox_unpacked_struct;
 mod queue_concat_index_prefilled_prefix;
 #[path = "collections/std_randomize_multidim.rs"]
 mod std_randomize_multidim;
+#[path = "collections/queue_struct_pop.rs"]
+mod queue_struct_pop;
+#[path = "collections/assoc_locator_methods.rs"]
+mod assoc_locator_methods;
